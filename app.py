@@ -47,7 +47,7 @@ with st.sidebar:
     if st.button("🗑️ Reiniciar Sesión"):
         st.session_state.history_df = pd.DataFrame(columns=["Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"])
         st.rerun()
-    st.caption("v9.3.0 | Full View Stable")
+    st.caption("v9.4.0 | Dashboard Stable Fix")
 
 # --- FUNCIONES ---
 def map_to_yahoo(symbol):
@@ -90,18 +90,21 @@ def run_analysis():
     # Posiciones
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
     raw = r_pos.json().get('positions', {}).get('position', [])
-    if raw is None or raw == 'null': return net_liq, 0, 0, 0, 0, {}, []
+    if raw is None or raw == 'null': return net_liq, 0, 0, 0, 0, {}, [], 1.0
     if isinstance(raw, dict): raw = [raw]
 
     # Market Data
     syms = ["SPY"] + [p['symbol'] for p in raw] + [get_underlying_symbol(p['symbol']) for p in raw]
     r_q = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': ",".join(list(set(syms))), 'greeks': 'true'}, headers=get_headers())
     m_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])}
+    
+    # Obtener precio SPY
     spy_p = float(m_map.get('SPY', {}).get('last', 685))
 
     # Yahoo Data para Betas
     spy_df = yf.download("SPY", period="1y", progress=False)
-    spy_ret = (spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']).tz_localize(None).pct_change().dropna()
+    spy_prices = spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']
+    spy_ret = spy_prices.tz_localize(None).pct_change().dropna()
     
     # Greeks & Netting
     total_raw_delta, total_theta, total_abs_exp, total_bwd = 0, 0, 0, 0
@@ -137,15 +140,15 @@ def run_analysis():
         total_bwd += (data['delta_usd'] * data['beta']) / spy_p if spy_p > 0 else 0
         total_abs_exp += abs(data['delta_usd'])
 
-    return net_liq, total_raw_delta, total_bwd, total_theta, total_abs_exp/net_liq, t_map, detailed_list
+    return net_liq, total_raw_delta, total_bwd, total_theta, total_abs_exp/net_liq, t_map, detailed_list, spy_p
 
 # --- FLUJO DE UI ---
 
 if TRADIER_TOKEN:
-    if st.button("🔄 ACTUALIZAR DASHBOARD"):
+    if st.button("🚀 ACTUALIZAR DASHBOARD"):
         res = run_analysis()
         if res:
-            nl, rd, bwd, th, lev, r_map, d_list = res
+            nl, rd, bwd, th, lev, r_map, d_list, spy_price = res
             
             # Actualizar Historial
             new_entry = {
@@ -163,7 +166,7 @@ if TRADIER_TOKEN:
             
             c1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{colors[0]}">{rd:.1f}</div><div class="metric-sub">Deltas Puros</div></div>', unsafe_allow_html=True)
             c2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{colors[1]}">{bwd:.1f}</div><div class="metric-sub">Riesgo Beta-Ajustado</div></div>', unsafe_allow_html=True)
-            c3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{colors[2]}">${th:.2f}</div><div class="metric-sub">Paso del Tiempo</div></div>', unsafe_allow_html=True)
+            c3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{colors[2]}">${th:.2f}</div><div class="metric-sub">Income Diario</div></div>', unsafe_allow_html=True)
             c4.markdown(f'<div class="card" style="border-bottom:5px solid {l_c}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value" style="color:{l_c}">{lev:.2f}x</div><div class="metric-sub">Nocional / Cash</div></div>', unsafe_allow_html=True)
 
             # --- HISTORIAL ---
@@ -174,24 +177,29 @@ if TRADIER_TOKEN:
                 row1_c1, row1_c2 = st.columns(2)
                 with row1_c1:
                     st.caption("💰 Evolución Balance Neto")
-                    st.area_chart(h, x="Timestamp", y="Net_Liq", color="#00d4ff")
+                    st.area_chart(h, x="Timestamp", y="Net_Liq")
                 with row1_c2:
                     st.caption("⚖️ Evolución BWD (Riesgo SPY)")
-                    st.line_chart(h, x="Timestamp", y="BWD_SPY", color="#4ade80")
+                    st.line_chart(h, x="Timestamp", y="BWD_SPY")
 
                 row2_c1, row2_c2, row2_c3 = st.columns(3)
-                with row2_c1: st.line_chart(h, x="Timestamp", y="Delta_Neto")
-                with row2_c2: st.line_chart(h, x="Timestamp", y="Theta_Diario")
-                with row2_c3: st.line_chart(h, x="Timestamp", y="Apalancamiento")
+                with row2_c1:
+                    st.caption("🎯 Delta Neto")
+                    st.line_chart(h, x="Timestamp", y="Delta_Neto")
+                with row2_c2:
+                    st.caption("⏳ Theta Diario")
+                    st.line_chart(h, x="Timestamp", y="Theta_Diario")
+                with row2_c3:
+                    st.caption("🚀 Apalancamiento")
+                    st.line_chart(h, x="Timestamp", y="Apalancamiento")
                 
                 csv = h.to_csv(index=False).encode('utf-8')
-                st.download_button("💾 Exportar Sesión (.csv)", csv, f"trading_log_{datetime.now().strftime('%H%M')}.csv")
+                st.download_button("💾 Exportar Datos (.csv)", csv, f"session_{datetime.now().strftime('%H%M')}.csv")
 
             # --- TABLA 1: RIESGO NETO POR ACTIVO ---
             st.divider()
             st.subheader("📊 Riesgo Neto por Activo")
             
-            # Preparamos los datos del mapa para la tabla sin errores de nombres
             grouped_rows = []
             for k, v in r_map.items():
                 grouped_rows.append({
@@ -217,3 +225,4 @@ if TRADIER_TOKEN:
                 }), use_container_width=True)
 else:
     st.info("👈 Ingresa tu Token para iniciar.")
+
