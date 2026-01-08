@@ -1,217 +1,242 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
 import re
-from datetime import datetime, timedelta
+import yfinance as yf
+from datetime import datetime
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="PMCC Master Accountant", page_icon="🧾")
+st.set_page_config(layout="wide", page_title="PMCC Intelligence Center", page_icon="🛡️")
 
 # Estilos CSS Profesionales
 st.markdown("""
     <style>
     .stApp {background-color: #0e1117;}
-    .summary-card {
-        background-color: #161b22; padding: 15px; border-radius: 5px; 
-        border: 1px solid #30363d; text-align: center;
+    .card {
+        background-color: #1f2937; 
+        padding: 20px; border-radius: 10px; 
+        border: 1px solid #374151; text-align: center; height: 100%;
     }
-    .kpi-label {color: #8b949e; font-size: 0.8rem; font-weight: bold;}
-    .kpi-value {color: #ffffff; font-size: 1.4rem; font-weight: bold;}
-    .roi-pos {color: #2ea043; font-size: 1.5rem; font-weight: bold;}
-    .roi-neg {color: #f87171; font-size: 1.5rem; font-weight: bold;}
+    .metric-label {color: #aaa; font-size: 0.8rem; font-weight: bold;}
+    .metric-value {font-size: 1.6rem; font-weight: bold; margin: 0;}
     .section-header {
         background-color: #238636; color: white; padding: 5px 15px; 
         border-radius: 5px; margin: 20px 0 10px 0; font-weight: bold;
     }
+    .pmcc-summary-card {
+        background-color: #161b22; border: 1px solid #30363d;
+        padding: 10px; border-radius: 8px; text-align: center;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🏗️ PMCC Master Accountant (V11.6 - Auditor)")
+st.title("🛡️ Portfolio Intelligence & PMCC Accountant")
+
+# --- INICIALIZAR HISTORIAL EN MEMORIA (Gráficos de sesión) ---
+if 'history_df' not in st.session_state:
+    st.session_state.history_df = pd.DataFrame(columns=["Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"])
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("🔑 Conexión")
-    TOKEN = st.text_input("Tradier Token", type="password")
+    st.header("📡 Conexión Broker")
+    TRADIER_TOKEN = st.text_input("Tradier Access Token", type="password")
     env_mode = st.radio("Entorno", ["Producción", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción" else "https://sandbox.tradier.com/v1"
+    st.divider()
+    if st.button("🗑️ Reiniciar Sesión"):
+        st.session_state.history_df = pd.DataFrame(columns=["Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"])
+        st.rerun()
+    st.caption("v11.7.0 | Bulletproof Auditor")
 
-# --- FUNCIONES CORE ---
-def get_headers(): return {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+# --- FUNCIONES DE APOYO ---
+def get_headers(): return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
 
-def get_underlying(symbol):
+def get_underlying_symbol(symbol):
+    if len(symbol) < 6: return symbol
     match = re.match(r"([A-Z]+)", symbol)
     return match.group(1) if match else symbol
 
-def parse_tradier_date(date_str):
-    try: return datetime.strptime(date_str[:10], '%Y-%m-%d')
-    except: return datetime.now()
+def clean_data(df):
+    if isinstance(df, pd.Series): df = df.to_frame()
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+    df = df[[col]].copy()
+    df.index = df.index.tz_localize(None)
+    return df
 
-def run_accounting():
-    # 1. Obtener Cuenta
-    r_profile = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
-    if r_profile.status_code != 200: return None
-    acct = r_profile.json()['profile']['account']
+@st.cache_data(ttl=3600)
+def calculate_beta(ticker, spy_returns):
+    if ticker in ['BIL', 'SGOV', 'SHV']: return 0.0
+    try:
+        sym = '^GSPC' if ticker in ['SPX', 'SPXW'] else ticker
+        stock_raw = yf.download(sym, period="1y", progress=False)
+        if stock_raw.empty: return 1.0
+        ret = clean_data(stock_raw).pct_change().dropna()
+        aligned = pd.concat([ret, spy_returns], axis=1, join='inner').dropna()
+        return aligned.iloc[:,0].cov(aligned.iloc[:,1]) / aligned.iloc[:,1].var()
+    except: return 1.0
+
+# --- MOTOR DE DATOS ---
+def run_full_analysis():
+    # 1. Cuenta
+    r_p = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
+    if r_p.status_code != 200: return None
+    acct = r_p.json()['profile']['account']
     acct_id = acct[0]['account_number'] if isinstance(acct, list) else acct['account_number']
+    
+    r_b = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
+    net_liq = float(r_b.json()['balances']['total_equity'])
 
-    # 2. Obtener Posiciones (Para el CORE y Corto Activo)
+    # 2. Posiciones
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
-    positions = r_pos.json().get('positions', {}).get('position', [])
-    if not positions or positions == 'null': positions = []
-    if isinstance(positions, dict): positions = [positions]
+    raw_pos = r_pos.json().get('positions', {}).get('position', [])
+    if not raw_pos or raw_pos == 'null': raw_pos = []
+    if isinstance(raw_pos, dict): raw_pos = [raw_pos]
 
-    # 3. Obtener Historial Extendido (Pidiendo 1000 registros para profundidad histórica)
+    # 3. Historial (Contabilidad)
     r_hist = requests.get(f"{BASE_URL}/accounts/{acct_id}/history", params={'limit': 1000}, headers=get_headers())
-    history = r_hist.json().get('history', {}).get('event', []) if r_hist.status_code == 200 else []
-    if isinstance(history, dict): history = [history]
+    raw_hist = r_hist.json().get('history', {}).get('event', []) if r_hist.status_code == 200 else []
+    if isinstance(raw_hist, dict): raw_hist = [raw_hist]
 
-    # 4. Market Data Actual
-    all_syms = list(set([p['symbol'] for p in positions] + [get_underlying(p['symbol']) for p in positions] + ["SPY"]))
+    # 4. Market Data
+    all_syms = list(set(["SPY"] + [p['symbol'] for p in raw_pos] + [get_underlying_symbol(p['symbol']) for p in raw_pos]))
     r_q = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': ",".join(all_syms), 'greeks': 'true'}, headers=get_headers())
-    q_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])} if r_q else {}
+    m_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])} if r_q.status_code == 200 else {}
+    spy_p = float(m_map.get('SPY', {}).get('last', 685))
 
-    # --- PROCESAMIENTO ---
-    unique_tickers = list(set([get_underlying(p['symbol']) for p in positions if len(p['symbol']) > 5]))
-    report = {}
+    # 5. Yahoo para Betas
+    spy_df = yf.download("SPY", period="1y", progress=False)
+    spy_ret = clean_data(spy_df).pct_change().dropna()
 
-    for t in unique_tickers:
-        u_price = q_map.get(t, {}).get('last', 0)
+    # 6. Procesamiento
+    total_rd, total_th, total_exp, total_bwd = 0, 0, 0, 0
+    ticker_risk = {}
+    detailed = []
+
+    for p in raw_pos:
+        sym = p['symbol']
+        qty = float(p['quantity'])
+        u_sym = get_underlying_symbol(sym)
+        m_d = m_map.get(sym, {})
+        u_p = float(m_map.get(u_sym, {}).get('last', 0))
+        is_opt = len(sym) > 5
+        mult = 100 if is_opt else 1
         
-        # A. CORE POSITION (LEAPS)
-        leaps = []
-        total_leaps_cost = 0
-        current_leaps_val = 0
-        earliest_date = datetime.now()
-
-        for p in positions:
-            if get_underlying(p['symbol']) == t and float(p['quantity']) > 0:
-                q = q_map.get(p['symbol'], {})
-                # Criterio Leaps: Más de 0.50 delta o vencimiento lejano
-                if q.get('greeks', {}).get('delta', 0) > 0.50:
-                    c = abs(float(p['cost_basis']))
-                    v = float(p['quantity']) * q.get('last', 0) * 100
-                    total_leaps_cost += c
-                    current_leaps_val += v
-                    
-                    p_date = parse_tradier_date(p['date_acquired'])
-                    if p_date < earliest_date: earliest_date = p_date
-
-                    leaps.append({
-                        "Date": p_date.strftime('%Y-%m-%d'), "Exp": q.get('expiration_date'),
-                        "Strike": q.get('strike'), "Qty": p['quantity'],
-                        "Cost": c, "Market Val": v, "P/L": v - c
-                    })
-
-        if not leaps: continue # Si no hay LEAPS, ignorar activo
-
-        # B. MOTOR DE HISTORIAL (CC REALIZADO) - LÓGICA DE AUDITORÍA
-        realized_profit = 0
-        closed_trades = []
+        d = float(m_d.get('greeks', {}).get('delta', 1.0 if not is_opt else 0))
+        th = float(m_d.get('greeks', {}).get('theta', 0))
+        ex = float(m_d.get('greeks', {}).get('extrinsic', 0))
         
-        # Filtrar trades de este activo que sean opciones
-        asset_history = [h for h in history if h.get('type') == 'trade' and 'symbol' in h and get_underlying(h['symbol']) == t and len(h['symbol']) > 6]
+        if u_sym not in ticker_risk:
+            ticker_risk[u_sym] = {'d_usd': 0, 'th_usd': 0, 'd_puro': 0, 'beta': calculate_beta(u_sym, spy_ret), 'price': u_p}
         
-        # Agrupar por contrato específico
-        for sym, events in pd.DataFrame(asset_history).groupby('symbol'):
-            events = events.sort_values('date')
-            
-            sto_event = None
-            for idx, row in events.iterrows():
-                # Escenario 1: Vendimos para abrir (STO)
-                if row['side'] == 'sell_to_open':
-                    sto_event = row
-                # Escenario 2: Compramos para cerrar (BTC)
-                elif row['side'] == 'buy_to_close' and sto_event is not None:
-                    p_sto = abs(float(sto_event['price']))
-                    p_btc = abs(float(row['price']))
-                    qty = abs(float(row['quantity']))
-                    pnl = (p_sto - p_btc) * 100 * qty
-                    
-                    d_sto = parse_tradier_date(sto_event['date'])
-                    d_btc = parse_tradier_date(row['date'])
-                    
-                    closed_trades.append({
-                        "Open Date": d_sto.strftime('%m/%d/%y'), "Close Date": d_btc.strftime('%m/%d/%y'),
-                        "Strike": sym[-8:], "STO": p_sto, "BTC": p_btc, "P/L": pnl, "DIT": (d_btc - d_sto).days
-                    })
-                    realized_profit += pnl
-                    sto_event = None # Reset para el siguiente ciclo de este contrato
+        ticker_risk[u_sym]['d_usd'] += (qty * d * mult * u_p)
+        ticker_risk[u_sym]['th_usd'] += (qty * th * mult)
+        ticker_risk[u_sym]['d_puro'] += (qty * d * mult)
+        total_rd += (qty * d * mult)
+        total_th += (qty * th * mult)
+        
+        detailed.append({
+            "Symbol": sym, "Qty": qty, "Underlying": u_sym, "Type": "option" if is_opt else "stock",
+            "Delta": d, "Theta": th, "Price": u_p, "Extrinsic": ex, "Strike": m_d.get('strike', 0),
+            "Exp": m_d.get('expiration_date', 'N/A'), "Cost": abs(float(p.get('cost_basis', 0)))
+        })
 
-            # Escenario 3: Venta que ya no está en posiciones y no tuvo BTC (Expiración)
-            # Buscamos si la opción ya no está abierta
-            is_currently_open = any(p['symbol'] == sym for p in positions)
-            if sto_event is not None and not is_currently_open:
-                # Si vendimos y ya no está en cartera, asumimos que expiró worthless
-                p_sto = abs(float(sto_event['price']))
-                qty = abs(float(sto_event['quantity']))
-                pnl = p_sto * 100 * qty
-                d_sto = parse_tradier_date(sto_event['date'])
-                
-                closed_trades.append({
-                    "Open Date": d_sto.strftime('%m/%d/%y'), "Close Date": "EXPIRED",
-                    "Strike": sym[-8:], "STO": p_sto, "BTC": 0.00, "P/L": pnl, "DIT": "-"
-                })
-                realized_profit += pnl
+    for s, data in ticker_risk.items():
+        total_bwd += (data['d_usd'] * data['beta']) / spy_p if spy_p > 0 else 0
+        total_exp += abs(data['d_usd'])
 
-        # C. IDENTIFICAR CORTO ACTIVO (JUGO)
-        active_short = None
-        for p in positions:
-            if get_underlying(p['symbol']) == t and float(p['quantity']) < 0:
-                q = q_map.get(p['symbol'], {})
-                strike = q.get('strike', 0)
-                price = q.get('last', 0)
-                ext = price - max(0, u_price - strike)
-                active_short = {
-                    "Strike": strike, "Price": price, "Ext": ext, 
-                    "DTE": (datetime.strptime(q['expiration_date'], '%Y-%m-%d') - datetime.now()).days
-                }
+    return {
+        "net_liq": net_liq, "rd": total_rd, "bwd": total_bwd, "th": total_th, 
+        "lev": total_exp/net_liq if net_liq > 0 else 0, "r_map": ticker_risk, 
+        "detailed": detailed, "history": raw_hist, "spy_p": spy_p
+    }
 
-        # D. RESUMEN FINAL (ESTILO TOM KING)
-        leaps_pnl = current_leaps_val - total_leaps_cost
-        net_income = leaps_pnl + realized_profit
-        roi = (net_income / total_leaps_cost * 100) if total_leaps_cost > 0 else 0
-        dit_total = (datetime.now() - earliest_date).days
-        roi_anual = (roi / max(1, dit_total)) * 365
+# --- INTERFAZ ---
+t1, t2 = st.tabs(["📊 Riesgo & Historial", "🏗️ PMCC Accountant"])
 
-        report[t] = {
-            "summary": {"cost": total_leaps_cost, "val": current_leaps_val, "realized": realized_profit, "net": net_income, "roi": roi, "roi_a": roi_anual, "dit": dit_total},
-            "leaps": leaps, "history": closed_trades, "active": active_short, "spot": u_price
-        }
-
-    return report
-
-# --- RENDERIZADO ---
-if TOKEN:
-    if st.button("🚀 ACTUALIZAR REPORTE CONTABLE"):
-        data = run_accounting()
+if TRADIER_TOKEN:
+    if st.button("🚀 ACTUALIZAR SISTEMA"):
+        data = run_full_analysis()
         if data:
-            for ticker, d in data.items():
-                st.markdown(f'<div class="section-header">ACTIVO: {ticker} (Spot: ${d["spot"]:.2f})</div>', unsafe_allow_html=True)
-                
-                s = d['summary']
-                c1, c2, c3, c4, c5 = st.columns(5)
-                c1.markdown(f'<div class="summary-card"><p class="kpi-label">COSTO LEAPS</p><p class="kpi-value">${s["cost"]:,.2f}</p></div>', unsafe_allow_html=True)
-                c2.markdown(f'<div class="summary-card"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${s["val"]:,.2f}</p></div>', unsafe_allow_html=True)
-                c3.markdown(f'<div class="summary-card"><p class="kpi-label">CC REALIZADO</p><p class="kpi-value" style="color:#4ade80">${s["realized"]:,.2f}</p></div>', unsafe_allow_html=True)
-                c4.markdown(f'<div class="summary-card"><p class="kpi-label">NET INCOME</p><p class="kpi-value">${s["net"]:,.2f}</p><small style="color:#888">DIT: {s["dit"]}</small></div>', unsafe_allow_html=True)
-                
-                r_style = "roi-pos" if s['roi'] > 0 else "roi-neg"
-                c5.markdown(f'<div class="summary-card"><p class="kpi-label">ROI TOTAL / ANUAL</p><p class="{r_style}">{s["roi"]:.1f}% / {s["roi_a"]:.1f}%</p></div>', unsafe_allow_html=True)
+            # Snapshot para gráficos
+            st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([{
+                "Timestamp": datetime.now().strftime("%H:%M:%S"), "Net_Liq": data['net_liq'], 
+                "Delta_Neto": data['rd'], "BWD_SPY": data['bwd'], "Theta_Diario": data['th'], "Apalancamiento": data['lev']
+            }])], ignore_index=True)
 
-                st.write("### 🏛️ CORE POSITION (LEAPS)")
-                st.table(pd.DataFrame(d['leaps']).style.format({"Cost": "${:,.2f}", "Market Val": "${:,.2f}", "P/L": "${:,.2f}"}))
-
-                if d['active']:
-                    a = d['active']
-                    st.write(f"### 🥤 MONITOR DE JUGO: Strike {a['Strike']} | DTE: {a['DTE']} | **Extrínseco: ${a['Ext']:.2f}**")
-                    if a['Ext'] < 0.15: st.error("🚨 CRÍTICO: Poco valor extrínseco. ¡Hora de ROLEAR!")
-
-                if d['history']:
-                    with st.expander("📔 Ver Historial de Cortos Cerrados (Bitácora)"):
-                        st.table(pd.DataFrame(d['history']).sort_values("Open Date", ascending=False))
+            with t1:
+                st.markdown(f"### 🏦 Balance Neto: ${data['net_liq']:,.2f}")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value">{data["rd"]:.1f}</div></div>', unsafe_allow_html=True)
+                c2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value">{data["bwd"]:.1f}</div></div>', unsafe_allow_html=True)
+                c3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value">${data["th"]:.2f}</div></div>', unsafe_allow_html=True)
+                c4.markdown(f'<div class="card" style="border-bottom:5px solid {"#4ade80" if data["lev"] < 1.5 else "#facc15"}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value">{data["lev"]:.2f}x</div></div>', unsafe_allow_html=True)
                 
-                st.divider()
-        else:
-            st.warning("No se encontraron campañas PMCC. Asegúrate que tu LEAPS tenga Delta > 0.50.")
+                h = st.session_state.history_df
+                if len(h) > 1:
+                    st.subheader("📈 Tendencia")
+                    g1, g2 = st.columns(2)
+                    g1.area_chart(h, x="Timestamp", y="Net_Liq")
+                    g2.line_chart(h, x="Timestamp", y="BWD_SPY")
+
+                st.subheader("📊 Riesgo por Activo")
+                r_rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['d_puro'], "Net Delta $": v['d_usd'], "BWD": (v['d_usd']*v['beta'])/data['spy_p']} for k,v in data['r_map'].items()]
+                st.dataframe(pd.DataFrame(r_rows).style.format({"Beta":"{:.2f}", "Net Delta $":"${:,.0f}", "BWD":"{:.2f}"}), use_container_width=True)
+
+            with t2:
+                st.subheader("🏗️ Contabilidad PMCC")
+                df_d = pd.DataFrame(data['detailed'])
+                if not df_d.empty:
+                    df_opt = df_d[df_d['Type'] == "option"]
+                    for und, group in df_opt.groupby('Underlying'):
+                        longs = group[(group['Qty'] > 0) & (group['Delta'].abs() > 0.60)]
+                        shorts = group[(group['Qty'] < 0) & (group['Delta'].abs() < 0.50)]
+                        
+                        if not longs.empty:
+                            realized_pnl = 0
+                            closed_trades = []
+                            # FILTRO SEGURO PARA HISTORIAL
+                            asset_hist = [h for h in data['history'] if h.get('type')=='trade' and 'symbol' in h and get_underlying_symbol(h['symbol'])==und]
+                            
+                            if asset_hist:
+                                df_ah = pd.DataFrame(asset_hist)
+                                if 'symbol' in df_ah.columns:
+                                    for sym, events in df_ah.groupby('symbol'):
+                                        evs = events.sort_values('date')
+                                        temp_sto = None
+                                        for _, row in evs.iterrows():
+                                            if row['side'] == 'sell_to_open': temp_sto = row
+                                            elif row['side'] == 'buy_to_close' and temp_sto is not None:
+                                                pnl = (abs(float(temp_sto['price'])) - abs(float(row['price']))) * 100 * abs(float(row['quantity']))
+                                                realized_pnl += pnl
+                                                closed_trades.append({"STO": temp_sto['date'][:10], "BTC": row['date'][:10], "Strike": sym[-8:], "P/L": pnl})
+                                                temp_sto = None
+
+                            l_cost = longs['Cost'].sum()
+                            l_val = (longs['Price'] * longs['Qty'] * 100).sum()
+                            net_inc = (l_val - l_cost) + realized_pnl
+
+                            st.markdown(f'<div class="section-header">ACTIVO: {und}</div>', unsafe_allow_html=True)
+                            cont1, cont2, cont3 = st.columns(3)
+                            cont1.markdown(f'<div class="pmcc-summary-card"><small>CC REALIZADO</small><br><b style="color:#4ade80">${realized_pnl:,.2f}</b></div>', unsafe_allow_html=True)
+                            cont2.markdown(f'<div class="pmcc-summary-card"><small>NET INCOME (P/L)</small><br><b>${net_inc:,.0f}</b></div>', unsafe_allow_html=True)
+                            cont3.markdown(f'<div class="pmcc-summary-card"><small>ROI</small><br><b>{(net_inc/l_cost*100):.1f}%</b></div>', unsafe_allow_html=True)
+                            
+                            st.table(longs[['Exp', 'Strike', 'Qty', 'Delta']])
+                            if not shorts.empty:
+                                sc = shorts.iloc[0]
+                                j = sc['Extrinsic'] * 100 * abs(sc['Qty'])
+                                st.write(f"🥤 **Short:** K {sc['Strike']} | Exp: {sc['Exp']} | **Jugo: ${j:.2f}**")
+                                if j < 15: st.error("⚠️ TIEMPO DE ROLEAR")
+                            if closed_trades:
+                                with st.expander("📔 Ver Historial"): st.table(pd.DataFrame(closed_trades))
+                            st.divider()
+                else:
+                    st.info("Agrega posiciones de opciones para ver el análisis PMCC.")
+            
+            with st.expander("Ver Datos Crudos"): st.dataframe(df_d)
 else:
-    st.info("👈 Introduce tu Token para auditar la cuenta.")
+    st.info("👈 Ingresa tu Token para iniciar.")
+
 
