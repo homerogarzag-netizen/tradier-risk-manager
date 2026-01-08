@@ -1,214 +1,235 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
-import numpy as np
 import requests
 import re
-import time
-import plotly.graph_objects as go
 from datetime import datetime
+import numpy as np
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="Risk & PMCC Commander", page_icon="🛡️")
+st.set_page_config(layout="wide", page_title="PMCC Master Accountant", page_icon="🧾")
 
-# Estilos CSS Profesionales
+# Estilo CSS para imitar la hoja de Tom King
 st.markdown("""
     <style>
     .stApp {background-color: #0e1117;}
-    .card {
-        background-color: #1f2937; 
-        padding: 20px; border-radius: 10px; 
-        border: 1px solid #374151; text-align: center; height: 100%;
+    .summary-card {
+        background-color: #161b22; padding: 15px; border-radius: 5px; 
+        border: 1px solid #30363d; text-align: center;
     }
-    .metric-label {color: #aaa; font-size: 0.9rem; font-weight: bold;}
-    .metric-value {font-size: 1.8rem; font-weight: bold; margin: 0;}
-    .pmcc-header {background-color: #161b22; padding: 10px; border-radius: 5px; border-left: 5px solid #00d4ff; margin-bottom: 10px;}
+    .kpi-label {color: #8b949e; font-size: 0.8rem; font-weight: bold;}
+    .kpi-value {color: #ffffff; font-size: 1.4rem; font-weight: bold;}
+    .roi-positive {color: #2ea043; font-size: 1.6rem; font-weight: bold;}
+    .section-header {
+        background-color: #238636; color: white; padding: 5px 15px; 
+        border-radius: 5px; margin: 20px 0 10px 0; font-weight: bold;
+    }
+    .table-container {margin-bottom: 30px;}
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ Portfolio Intelligence & PMCC Center")
-
-# --- INICIALIZAR HISTORIAL ---
-if 'history_df' not in st.session_state:
-    st.session_state.history_df = pd.DataFrame(columns=[
-        "Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"
-    ])
+st.title("🏗️ PMCC Master Accountant")
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.header("📡 Conexión Broker")
-    TRADIER_TOKEN = st.text_input("Tradier Access Token", type="password")
-    env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
-    BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
+    st.header("🔑 Credenciales")
+    TOKEN = st.text_input("Tradier Token", type="password")
+    BASE_URL = "https://api.tradier.com/v1"
     st.divider()
-    if st.button("🗑️ Reiniciar Sesión"):
-        st.session_state.history_df = pd.DataFrame(columns=["Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"])
-        st.rerun()
-    st.caption("v10.2.0 | Absolute Stability Fix")
+    st.info("Este dashboard recrea la metodología contable de Tom King integrando datos en tiempo real.")
 
-# --- FUNCIONES ---
-def map_to_yahoo(symbol):
-    s = symbol.upper().strip()
-    if s in ['SPX', 'SPXW', 'SPX.X']: return '^GSPC'
-    if s in ['NDX', 'NDXW', 'NDX.X']: return '^NDX'
-    if s in ['RUT', 'RUTW', 'RUT.X']: return '^RUT'
-    return s.replace('/', '-')
+# --- FUNCIONES API ---
+def get_headers(): return {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
 
-def get_underlying_symbol(symbol):
-    if len(symbol) < 6: return symbol
+def fetch_tradier(endpoint, params=None):
+    r = requests.get(f"{BASE_URL}{endpoint}", params=params, headers=get_headers())
+    return r.json() if r.status_code == 200 else None
+
+def get_underlying(symbol):
     match = re.match(r"([A-Z]+)", symbol)
     return match.group(1) if match else symbol
 
-def get_headers():
-    return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
+# --- MOTOR DE CONTABILIDAD ---
 
-def clean_data(df):
-    if isinstance(df, pd.Series): df = df.to_frame()
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
-    df = df[[col]].copy()
-    df.index = df.index.tz_localize(None)
-    return df
+def process_pmcc_logic():
+    # 1. Obtener Perfil y Cuenta
+    profile = fetch_tradier("/user/profile")
+    if not profile: return None
+    acct_id = profile['profile']['account']['account_number'] if isinstance(profile['profile']['account'], dict) else profile['profile']['account'][0]['account_number']
 
-@st.cache_data(ttl=3600)
-def calculate_beta_individual(ticker, spy_returns):
-    if ticker in ['BIL', 'SGOV', 'SHV', 'USFR']: return 0.0
-    yahoo_sym = map_to_yahoo(ticker)
-    try:
-        stock_raw = yf.download(yahoo_sym, period="1y", progress=False)
-        if stock_raw.empty: return 1.0
-        stock_ret = clean_data(stock_raw).pct_change().dropna()
-        aligned = pd.concat([stock_ret, spy_returns], axis=1, join='inner').dropna()
-        return aligned.iloc[:,0].cov(aligned.iloc[:,1]) / aligned.iloc[:,1].var()
-    except: return 1.0
-
-# --- LÓGICA DE DATOS ---
-def run_analysis():
-    r_p = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
-    if r_p.status_code != 200: return None
-    acct_data = r_p.json()['profile']['account']
-    acct_id = acct_data[0]['account_number'] if isinstance(acct_data, list) else acct_data['account_number']
+    # 2. Obtener Posiciones Actuales
+    pos_data = fetch_tradier(f"/accounts/{acct_id}/positions")
+    positions = pos_data.get('positions', {}).get('position', [])
+    if isinstance(positions, dict): positions = [positions]
     
-    r_b = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
-    net_liq = float(r_b.json()['balances']['total_equity'])
+    # 3. Obtener Historial (Últimos 90 días para cerrar el ciclo de Tom King)
+    hist_data = fetch_tradier(f"/accounts/{acct_id}/history", params={'limit': 100})
+    history = hist_data.get('history', {}).get('event', []) if hist_data else []
 
-    r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
-    raw = r_pos.json().get('positions', {}).get('position', [])
-    if not raw or raw == 'null': return net_liq, 0, 0, 0, 0, {}, [], 1.0
-    if isinstance(raw, dict): raw = [raw]
+    # 4. Obtener Precios y Griegas en Lote
+    all_syms = list(set([p['symbol'] for p in positions] + [get_underlying(p['symbol']) for p in positions]))
+    quotes_data = fetch_tradier("/markets/quotes", params={'symbols': ",".join(all_syms), 'greeks': 'true'})
+    q_map = {q['symbol']: q for q in quotes_data.get('quotes', {}).get('quote', [])} if quotes_data else {}
 
-    syms = ["SPY"] + [p['symbol'] for p in raw] + [get_underlying_symbol(p['symbol']) for p in raw]
-    r_q = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': ",".join(list(set(syms))), 'greeks': 'true'}, headers=get_headers())
-    m_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])}
-    spy_p = float(m_map.get('SPY', {}).get('last', 685))
-
-    spy_df = yf.download("SPY", period="1y", progress=False)
-    spy_ret = clean_data(spy_df).pct_change().dropna()
+    # --- PROCESAMIENTO POR TICKER ---
+    tickers = list(set([get_underlying(p['symbol']) for p in positions if len(p['symbol']) > 5]))
     
-    rd_tot, th_tot, exp_tot, bwd_tot = 0, 0, 0, 0
-    t_map = {}
-    detailed_list = []
-    
-    for p in raw:
-        qty = float(p['quantity'])
-        u_sym = get_underlying_symbol(p['symbol'])
-        m_d = m_map.get(p['symbol'], {})
-        u_p = float(m_map.get(u_sym, {}).get('last', 0))
-        is_opt = len(p['symbol']) > 5
-        mult = 100 if is_opt else 1
+    final_report = {}
+
+    for t in tickers:
+        # Filtrar info del activo
+        u_price = q_map.get(t, {}).get('last', 0)
         
-        d = float(m_d.get('greeks', {}).get('delta', 1.0 if not is_opt else 0))
-        th = float(m_d.get('greeks', {}).get('theta', 0))
-        ex = float(m_d.get('greeks', {}).get('extrinsic', 0))
+        # A. Identificar CORE POSITION (LEAPS)
+        core_positions = []
+        total_leaps_cost = 0
+        current_leaps_value = 0
         
-        if u_sym not in t_map:
-            t_map[u_sym] = {'delta_usd': 0, 'theta_usd': 0, 'delta_puro': 0, 'beta': calculate_beta_individual(u_sym, spy_ret), 'price': u_p}
-        
-        t_map[u_sym]['delta_usd'] += (qty * d * mult * u_p)
-        t_map[u_sym]['theta_usd'] += (qty * th * mult)
-        t_map[u_sym]['delta_puro'] += (qty * d * mult)
-        rd_tot += (qty * d * mult)
-        th_tot += (qty * th * mult)
-        
-        detailed_list.append({
-            "Symbol": p['symbol'], "Type": "option" if is_opt else "stock", 
-            "Qty": qty, "Underlying": u_sym, "Delta": d, "Theta": th, 
-            "Price": u_p, "Extrinsic": ex, "Exp": m_d.get('expiration_date', 'N/A'),
-            "Strike": m_d.get('strike', 0)
-        })
-
-    for s, data in t_map.items():
-        bwd_tot += (data['delta_usd'] * data['beta']) / spy_p if spy_p > 0 else 0
-        exp_tot += abs(data['delta_usd'])
-
-    return net_liq, rd_tot, bwd_tot, th_tot, exp_tot/net_liq, t_map, detailed_list, spy_p
-
-# --- UI ---
-tab_risk, tab_pmcc = st.tabs(["📊 Riesgo & Historial", "🏗️ PMCC Commander"])
-
-if TRADIER_TOKEN:
-    if st.button("🚀 ACTUALIZAR TODO"):
-        res = run_analysis()
-        if res:
-            nl, rd, bwd, th, lev, r_map, d_list, spy_p = res
-            st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([{
-                "Timestamp": datetime.now().strftime("%H:%M:%S"),
-                "Net_Liq": nl, "Delta_Neto": rd, "BWD_SPY": bwd, "Theta_Diario": th, "Apalancamiento": lev
-            }])], ignore_index=True)
-
-            with tab_risk:
-                st.markdown(f"### 🏦 Balance Neto: ${nl:,.2f}")
-                c1, c2, c3, c4 = st.columns(4)
-                col_d = "#4ade80" if rd > 0 else "#f87171"
-                col_b = "#4ade80" if bwd > 0 else "#f87171"
-                col_t = "#4ade80" if th > 0 else "#f87171"
-                col_l = "#4ade80" if lev < 1.5 else "#facc15"
+        for p in positions:
+            if get_underlying(p['symbol']) == t and float(p['quantity']) > 0:
+                q = q_map.get(p['symbol'], {})
+                exp = q.get('expiration_date', 'N/A')
+                delta = q.get('greeks', {}).get('delta', 0)
                 
-                c1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{col_d}">{rd:.1f}</div></div>', unsafe_allow_html=True)
-                c2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{col_b}">{bwd:.1f}</div></div>', unsafe_allow_html=True)
-                c3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{col_t}">${th:.2f}</div></div>', unsafe_allow_html=True)
-                c4.markdown(f'<div class="card" style="border-bottom:5px solid {col_l}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value">{lev:.2f}x</div></div>', unsafe_allow_html=True)
+                # Criterio LEAPS: Más de 180 días o Delta > 0.70
+                if delta and abs(delta) > 0.60:
+                    cost = abs(float(p['cost_basis']))
+                    val = float(p['quantity']) * q.get('last', 0) * 100
+                    total_leaps_cost += cost
+                    current_leaps_value += val
+                    
+                    core_positions.append({
+                        "Date": p['date_acquired'],
+                        "Exp": exp,
+                        "Strike": q.get('strike'),
+                        "QTY": p['quantity'],
+                        "Cost": f"${cost:,.2f}",
+                        "Market Val": f"${val:,.2f}",
+                        "P/L Latente": val - cost
+                    })
 
-                st.divider()
-                h = st.session_state.history_df
-                if len(h) > 1:
-                    st.subheader("📈 Tendencia de la Sesión")
-                    g1, g2 = st.columns(2)
-                    g1.write("**Capital ($)**")
-                    g1.area_chart(h, x="Timestamp", y="Net_Liq")
-                    g2.write("**Riesgo BWD (SPY)**")
-                    g2.line_chart(h, x="Timestamp", y="BWD_SPY")
-
-                st.subheader("📊 Riesgo Neto por Activo")
-                rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['delta_puro'], "Net Delta $": v['delta_usd'], "Net Theta $": v['theta_usd'], "BWD": (v['delta_usd'] * v['beta'])/spy_p} for k,v in r_map.items()]
-                st.dataframe(pd.DataFrame(rows).style.format({"Beta": "{:.2f}", "Net Delta $": "${:,.0f}", "Net Theta $": "${:,.2f}", "BWD": "{:.2f}"}), use_container_width=True)
-
-            with tab_pmcc:
-                st.subheader("🏗️ Monitor de Campañas PMCC")
-                df_op = pd.DataFrame(d_list)
-                if not df_op.empty:
-                    df_op = df_op[df_op['Type'] == "option"]
-                    for und, group in df_op.groupby('Underlying'):
-                        long_c = group[(group['Qty'] > 0) & (group['Delta'] > 0.60)]
-                        short_c = group[(group['Qty'] < 0) & (group['Delta'] < 0.45)]
-                        if not long_c.empty and not short_c.empty:
-                            lc, sc = long_c.iloc[0], short_c.iloc[0]
-                            st.markdown(f'<div class="pmcc-header">🚀 Activo: <b>{und}</b></div>', unsafe_allow_html=True)
-                            p1, p2, p3, p4 = st.columns(4)
-                            p1.write(f"**LEAPS**: K {lc['Strike']} | D: {lc['Delta']:.2f}")
-                            p2.write(f"**SHORT**: K {sc['Strike']} | D: {sc['Delta']:.2f}")
-                            juice = sc['Extrinsic'] * 100 * abs(sc['Qty'])
-                            p3.write(f"**JUGO**: ${juice:.2f}")
-                            if juice < 10: st.warning("🪫 Poco extrínseco.")
-                            p4.write(f"**SALUD**: {(lc['Delta']/abs(sc['Delta'])):.1f}x L/S")
-                            st.divider()
-                else:
-                    st.info("No se detectaron estructuras PMCC.")
+        # B. Reconstruir Historial Cerrado (CC P/L)
+        closed_trades = []
+        realized_profit = 0
+        
+        # Agrupar historial por contrato para encontrar pares STO/BTC
+        contract_hist = {}
+        for h in history:
+            if h.get('type') == 'trade' and get_underlying(h['symbol']) == t:
+                sym = h['symbol']
+                if sym not in contract_hist: contract_hist[sym] = []
+                contract_hist[sym].append(h)
+        
+        for sym, events in contract_hist.items():
+            # Buscamos pares (Venta de apertura y Compra de cierre)
+            sto = [e for e in events if e['side'] == 'sell_to_open']
+            btc = [e for e in events if e['side'] == 'buy_to_close']
             
-            with st.expander("Ver Detalle de Posiciones"):
-                st.dataframe(pd.DataFrame(d_list))
+            if sto and btc:
+                for s, b in zip(sto, btc):
+                    pnl = (abs(float(s['price'])) - abs(float(b['price']))) * 100 * abs(float(s['quantity']))
+                    realized_profit += pnl
+                    
+                    d1 = datetime.strptime(s['date'].split('T')[0], '%Y-%m-%d')
+                    d2 = datetime.strptime(b['date'].split('T')[0], '%Y-%m-%d')
+                    
+                    closed_trades.append({
+                        "Date STO": d1.strftime('%m/%d/%y'),
+                        "Date BTC": d2.strftime('%m/%d/%y'),
+                        "Strike": q_map.get(sym, {}).get('strike', 'N/A'),
+                        "STO Premium": f"${abs(float(s['price'])):.2f}",
+                        "BTC Price": f"${abs(float(b['price'])):.2f}",
+                        "P/L Realized": pnl,
+                        "DIT": (d2 - d1).days
+                    })
+
+        # C. Monitor de "Jugo" (Short Call Activo)
+        active_short = None
+        for p in positions:
+            if get_underlying(p['symbol']) == t and float(p['quantity']) < 0:
+                q = q_map.get(p['symbol'], {})
+                strike = q.get('strike', 0)
+                opt_price = q.get('last', 0)
+                
+                # Cálculo Extrínseco (Call): Price - Max(0, Stock - Strike)
+                intrinsic = max(0, u_price - strike)
+                extrinsic = opt_price - intrinsic
+                
+                active_short = {
+                    "Strike": strike,
+                    "Price": opt_price,
+                    "Extrinsic": extrinsic,
+                    "DTE": (datetime.strptime(q['expiration_date'], '%Y-%m-%d') - datetime.now()).days,
+                    "Status": "ROLL" if extrinsic < 0.20 else "O.K."
+                }
+
+        # D. Cálculos de Resumen (Tom King Style)
+        net_income = (current_leaps_value - total_leaps_cost) + realized_profit
+        roi = (net_income / total_leaps_cost * 100) if total_leaps_cost > 0 else 0
+        
+        final_report[t] = {
+            "summary": {
+                "Costo LEAPS": total_leaps_cost,
+                "Valor Actual": current_leaps_value,
+                "P/L LEAPS": current_leaps_value - total_leaps_cost,
+                "Realizado CC": realized_profit,
+                "Net Income": net_income,
+                "ROI": roi
+            },
+            "core": core_positions,
+            "history": closed_trades,
+            "active_short": active_short
+        }
+        
+    return final_report
+
+# --- RENDERIZADO DE INTERFAZ ---
+
+if TOKEN:
+    if st.button("🚀 ACTUALIZAR DASHBOARD"):
+        report = process_pmcc_logic()
+        
+        if report:
+            for ticker, data in report.items():
+                st.markdown(f'<div class="section-header">SYMBOL: {ticker}</div>', unsafe_allow_html=True)
+                
+                # 1. Resumen Superior
+                s = data['summary']
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.markdown(f'<div class="summary-card"><p class="kpi-label">COSTO BASE</p><p class="kpi-value">${s["Costo LEAPS"]:,.2f}</p></div>', unsafe_allow_html=True)
+                c2.markdown(f'<div class="summary-card"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${s["Valor Actual"]:,.2f}</p></div>', unsafe_allow_html=True)
+                c3.markdown(f'<div class="summary-card"><p class="kpi-label">CC P/L (REALIZADO)</p><p class="kpi-value" style="color:#4ade80">${s["Realizado CC"]:,.2f}</p></div>', unsafe_allow_html=True)
+                c4.markdown(f'<div class="summary-card"><p class="kpi-label">NET INCOME</p><p class="kpi-value">${s["Net Income"]:,.2f}</p></div>', unsafe_allow_html=True)
+                c5.markdown(f'<div class="summary-card"><p class="kpi-label">ROI TOTAL</p><p class="roi-positive">{s["ROI"]:.1f}%</p></div>', unsafe_allow_html=True)
+                
+                # 2. Core Position
+                st.write("### 🏛️ CORE POSITION (LEAPS)")
+                st.table(pd.DataFrame(data['core']))
+                
+                # 3. Monitor de Jugo (Live Short)
+                if data['active_short']:
+                    ash = data['active_short']
+                    st.write("### 🥤 EXTRINSIC TRACKER (ACTIVE SHORT)")
+                    color = "red" if ash['Status'] == "ROLL" else "#4ade80"
+                    st.markdown(f"""
+                        **Strike Actual:** {ash['Strike']} | **DTE:** {ash['DTE']} | 
+                        **Valor Extrínseco:** <span style="color:{color}; font-weight:bold;">${ash['Extrinsic']:.2f}</span> | 
+                        **Estado:** {ash['Status']}
+                    """, unsafe_allow_html=True)
+                
+                # 4. Bitácora Cerrada
+                st.write("### 📔 TRADE HISTORY (CLOSED CC)")
+                if data['history']:
+                    df_hist = pd.DataFrame(data['history'])
+                    st.dataframe(df_hist.style.format({"P/L Realized": "${:,.2f}"}), use_container_width=True)
+                else:
+                    st.info("No se encontraron trades cerrados recientemente para este activo.")
+                    
+                st.divider()
+        else:
+            st.error("No se pudieron obtener datos. Revisa tu token o conexión.")
 else:
-    st.info("👈 Ingresa tu Token en la barra lateral.")
+    st.info("👈 Por favor ingresa tu Token de Tradier para generar el reporte contable.")
+
 
 
 
