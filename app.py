@@ -44,12 +44,12 @@ with st.sidebar:
     if st.button("🗑️ Reiniciar Sesión"):
         st.session_state.history_df = pd.DataFrame(columns=["Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"])
         st.rerun()
-    st.caption("v10.0.0 | Multi-Module Active")
+    st.caption("v10.1.0 | Stable Charts")
 
-# --- FUNCIONES DE APOYO (MECÁNICA) ---
+# --- FUNCIONES DE APOYO ---
 def map_to_yahoo(symbol):
     s = symbol.upper().strip()
-    if s in ['SPX', 'SPXW', 'SPX.X']: return '^SPX'
+    if s in ['SPX', 'SPXW', 'SPX.X']: return '^GSPC'
     if s in ['NDX', 'NDXW', 'NDX.X']: return '^NDX'
     if s in ['RUT', 'RUTW', 'RUT.X']: return '^RUT'
     return s.replace('/', '-')
@@ -62,7 +62,6 @@ def get_underlying_symbol(symbol):
 def get_headers():
     return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
 
-# --- MOTOR DE BETA ---
 def clean_data(df):
     if isinstance(df, pd.Series): df = df.to_frame()
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
@@ -78,8 +77,8 @@ def calculate_beta_individual(ticker, spy_returns):
     try:
         stock_raw = yf.download(yahoo_sym, period="1y", progress=False)
         if stock_raw.empty: return 1.0
-        stock_returns = clean_data(stock_raw).pct_change().dropna()
-        aligned = pd.concat([stock_returns, spy_returns], axis=1, join='inner').dropna()
+        stock_ret = clean_data(stock_raw).pct_change().dropna()
+        aligned = pd.concat([stock_ret, spy_returns], axis=1, join='inner').dropna()
         return aligned.iloc[:,0].cov(aligned.iloc[:,1]) / aligned.iloc[:,1].var()
     except: return 1.0
 
@@ -88,15 +87,16 @@ def run_analysis():
     # 1. Cuenta y Balance
     r_p = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
     if r_p.status_code != 200: return None
-    acct = r_p.json()['profile']['account']
-    acct_id = acct[0]['account_number'] if isinstance(acct, list) else acct['account_number']
+    acct_data = r_p.json()['profile']['account']
+    acct_id = acct_data[0]['account_number'] if isinstance(acct_data, list) else acct_data['account_number']
+    
     r_b = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
     net_liq = float(r_b.json()['balances']['total_equity'])
 
     # 2. Posiciones
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
     raw = r_pos.json().get('positions', {}).get('position', [])
-    if raw is None or raw == 'null': return net_liq, 0, 0, 0, 0, {}, [], 1.0
+    if not raw or raw == 'null': return net_liq, 0, 0, 0, 0, {}, [], 1.0
     if isinstance(raw, dict): raw = [raw]
 
     # 3. Market Data (Tradier)
@@ -107,8 +107,7 @@ def run_analysis():
 
     # 4. Yahoo Data para Betas
     spy_df = yf.download("SPY", period="1y", progress=False)
-    spy_p_yf = spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']
-    spy_ret = spy_p_yf.tz_localize(None).pct_change().dropna()
+    spy_ret = clean_data(spy_df).pct_change().dropna()
     
     # 5. Greeks & Netting
     total_raw_delta, total_theta, total_abs_exp, total_bwd = 0, 0, 0, 0
@@ -116,11 +115,12 @@ def run_analysis():
     detailed_list = []
     
     for p in raw:
+        sym = p['symbol']
         qty = float(p['quantity'])
-        u_sym = get_underlying_symbol(p['symbol'])
-        m_d = m_map.get(p['symbol'], {})
+        u_sym = get_underlying_symbol(sym)
+        m_d = m_map.get(sym, {})
         u_p = float(m_map.get(u_sym, {}).get('last', 0))
-        is_option = len(p['symbol']) > 5
+        is_option = len(sym) > 5
         mult = 100 if is_option else 1
         
         d = float(m_d.get('greeks', {}).get('delta', 1.0 if not is_option else 0))
@@ -137,7 +137,7 @@ def run_analysis():
         total_theta += (qty * th * mult)
         
         detailed_list.append({
-            "Símbolo": p['symbol'], "Tipo": "Opción" if is_option else "Stock", 
+            "Símbolo": sym, "Tipo": "Opción" if is_option else "Stock", 
             "Qty": qty, "Underlying": u_sym, "Delta": d, "Theta": th, 
             "Price": u_p, "Extrinsic": ex, "Exp": m_d.get('expiration_date', 'N/A'),
             "Strike": m_d.get('strike', 0)
@@ -175,19 +175,21 @@ if TRADIER_TOKEN:
                 col3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{c_th}">${th:.2f}</div></div>', unsafe_allow_html=True)
                 col4.markdown(f'<div class="card" style="border-bottom:5px solid {c_lev}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value">{lev:.2f}x</div></div>', unsafe_allow_html=True)
 
-                # Gráficos de Historial
+                # Gráficos (SIN EL PARÁMETRO TITLE PARA EVITAR ERROR)
                 st.divider()
                 h = st.session_state.history_df
                 if len(h) > 1:
                     st.subheader("📈 Tendencia de la Sesión")
                     g1, g2 = st.columns(2)
-                    with g1: st.area_chart(h, x="Timestamp", y="Net_Liq", title="Capital")
-                    with g2: st.line_chart(h, x="Timestamp", y="BWD_SPY", title="Riesgo SPY")
+                    g1.write("**Capital ($)**")
+                    g1.area_chart(h, x="Timestamp", y="Net_Liq")
+                    g2.write("**Riesgo BWD (SPY)**")
+                    g2.line_chart(h, x="Timestamp", y="BWD_SPY")
 
                 # Tabla Agrupada
                 st.subheader("📊 Riesgo Neto por Activo")
-                rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['d_puro'], "Net Delta $": v['d_usd'], "Net Theta $": v['th_usd']} for k,v in r_map.items()]
-                st.dataframe(pd.DataFrame(rows).style.format({"Beta": "{:.2f}", "Net Delta $": "${:,.0f}", "Net Theta $": "${:,.2f}"}), use_container_width=True)
+                rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['d_puro'], "Net Delta $": v['d_usd'], "Net Theta $": v['th_usd'], "BWD": (v['d_usd'] * v['beta'])/spy_price} for k,v in r_map.items()]
+                st.dataframe(pd.DataFrame(rows).style.format({"Beta": "{:.2f}", "Net Delta $": "${:,.0f}", "Net Theta $": "${:,.2f}", "BWD": "{:.2f}"}), use_container_width=True)
 
             with tab_pmcc:
                 st.subheader("🏗️ Monitor de Campañas PMCC")
@@ -211,8 +213,12 @@ if TRADIER_TOKEN:
                             p4.write(f"**SALUD**: {(lc['Delta']/abs(sc['Delta'])):.1f}x L/S")
                             st.divider()
                 else:
-                    st.info("No se detectaron estructuras PMCC en la cartera.")
+                    st.info("No se detectaron estructuras PMCC.")
+            
+            with st.expander("Ver Detalle de Posiciones"):
+                st.dataframe(pd.DataFrame(d_list))
 else:
     st.info("👈 Ingresa tu Token en la barra lateral.")
+
 
 
