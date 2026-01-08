@@ -9,35 +9,32 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="Risk & Greeks Commander Pro", page_icon="🛡️")
+st.set_page_config(layout="wide", page_title="Risk & PMCC Commander", page_icon="🛡️")
 
-# Estilos CSS
+# Estilos CSS Profesionales
 st.markdown("""
     <style>
     .stApp {background-color: #0e1117;}
     .card {
         background-color: #1f2937; 
-        padding: 20px; 
-        border-radius: 10px; 
-        border: 1px solid #374151; 
-        text-align: center;
-        height: 100%;
+        padding: 20px; border-radius: 10px; 
+        border: 1px solid #374151; text-align: center; height: 100%;
     }
-    .metric-label {color: #aaa; font-size: 0.9rem; font-weight: bold; margin-bottom: 5px;}
+    .metric-label {color: #aaa; font-size: 0.9rem; font-weight: bold;}
     .metric-value {font-size: 1.8rem; font-weight: bold; margin: 0;}
-    .metric-sub {font-size: 0.8rem; color: #888; margin-top: 5px;}
+    .pmcc-header {background-color: #161b22; padding: 10px; border-radius: 5px; border-left: 5px solid #00d4ff; margin-bottom: 10px;}
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ Portfolio Intelligence Command Center")
+st.title("🛡️ Portfolio Intelligence & PMCC Center")
 
-# --- INICIALIZAR HISTORIAL ---
+# --- INICIALIZAR HISTORIAL EN MEMORIA ---
 if 'history_df' not in st.session_state:
     st.session_state.history_df = pd.DataFrame(columns=[
         "Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"
     ])
 
-# --- SIDEBAR ---
+# --- SIDEBAR: CONEXIÓN ---
 with st.sidebar:
     st.header("📡 Conexión Broker")
     TRADIER_TOKEN = st.text_input("Tradier Access Token", type="password")
@@ -47,9 +44,9 @@ with st.sidebar:
     if st.button("🗑️ Reiniciar Sesión"):
         st.session_state.history_df = pd.DataFrame(columns=["Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"])
         st.rerun()
-    st.caption("v9.4.0 | Dashboard Stable Fix")
+    st.caption("v10.0.0 | Multi-Module Active")
 
-# --- FUNCIONES ---
+# --- FUNCIONES DE APOYO (MECÁNICA) ---
 def map_to_yahoo(symbol):
     s = symbol.upper().strip()
     if s in ['SPX', 'SPXW', 'SPX.X']: return '^SPX'
@@ -65,21 +62,30 @@ def get_underlying_symbol(symbol):
 def get_headers():
     return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
 
+# --- MOTOR DE BETA ---
+def clean_data(df):
+    if isinstance(df, pd.Series): df = df.to_frame()
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+    df = df[[col]].copy()
+    df.index = df.index.tz_localize(None)
+    return df
+
 @st.cache_data(ttl=3600)
-def calculate_beta(ticker, spy_returns):
+def calculate_beta_individual(ticker, spy_returns):
     if ticker in ['BIL', 'SGOV', 'SHV', 'USFR']: return 0.0
+    yahoo_sym = map_to_yahoo(ticker)
     try:
-        stock = yf.download(map_to_yahoo(ticker), period="1y", progress=False)
-        stock.index = stock.index.tz_localize(None)
-        col = 'Adj Close' if 'Adj Close' in stock.columns else 'Close'
-        ret = stock[col].pct_change().dropna()
-        aligned = pd.concat([ret, spy_returns], axis=1, join='inner').dropna()
+        stock_raw = yf.download(yahoo_sym, period="1y", progress=False)
+        if stock_raw.empty: return 1.0
+        stock_returns = clean_data(stock_raw).pct_change().dropna()
+        aligned = pd.concat([stock_returns, spy_returns], axis=1, join='inner').dropna()
         return aligned.iloc[:,0].cov(aligned.iloc[:,1]) / aligned.iloc[:,1].var()
     except: return 1.0
 
-# --- CÁLCULOS ---
+# --- LÓGICA DE DATOS ---
 def run_analysis():
-    # Perfil y Balance
+    # 1. Cuenta y Balance
     r_p = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
     if r_p.status_code != 200: return None
     acct = r_p.json()['profile']['account']
@@ -87,26 +93,24 @@ def run_analysis():
     r_b = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
     net_liq = float(r_b.json()['balances']['total_equity'])
 
-    # Posiciones
+    # 2. Posiciones
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
     raw = r_pos.json().get('positions', {}).get('position', [])
     if raw is None or raw == 'null': return net_liq, 0, 0, 0, 0, {}, [], 1.0
     if isinstance(raw, dict): raw = [raw]
 
-    # Market Data
+    # 3. Market Data (Tradier)
     syms = ["SPY"] + [p['symbol'] for p in raw] + [get_underlying_symbol(p['symbol']) for p in raw]
     r_q = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': ",".join(list(set(syms))), 'greeks': 'true'}, headers=get_headers())
     m_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])}
-    
-    # Obtener precio SPY
     spy_p = float(m_map.get('SPY', {}).get('last', 685))
 
-    # Yahoo Data para Betas
+    # 4. Yahoo Data para Betas
     spy_df = yf.download("SPY", period="1y", progress=False)
-    spy_prices = spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']
-    spy_ret = spy_prices.tz_localize(None).pct_change().dropna()
+    spy_p_yf = spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']
+    spy_ret = spy_p_yf.tz_localize(None).pct_change().dropna()
     
-    # Greeks & Netting
+    # 5. Greeks & Netting
     total_raw_delta, total_theta, total_abs_exp, total_bwd = 0, 0, 0, 0
     t_map = {}
     detailed_list = []
@@ -116,113 +120,99 @@ def run_analysis():
         u_sym = get_underlying_symbol(p['symbol'])
         m_d = m_map.get(p['symbol'], {})
         u_p = float(m_map.get(u_sym, {}).get('last', 0))
-        mult = 100 if len(p['symbol']) > 5 else 1
+        is_option = len(p['symbol']) > 5
+        mult = 100 if is_option else 1
         
-        d = float(m_d.get('greeks', {}).get('delta', 1.0 if mult==1 else 0))
+        d = float(m_d.get('greeks', {}).get('delta', 1.0 if not is_option else 0))
         th = float(m_d.get('greeks', {}).get('theta', 0))
+        ex = float(m_d.get('greeks', {}).get('extrinsic', 0))
         
         if u_sym not in t_map:
-            t_map[u_sym] = {'delta_usd': 0, 'theta_usd': 0, 'delta_puro': 0, 'beta': calculate_beta(u_sym, spy_ret), 'price': u_p}
+            t_map[u_sym] = {'d_usd': 0, 'th_usd': 0, 'd_puro': 0, 'beta': calculate_beta_individual(u_sym, spy_ret), 'price': u_p}
         
-        t_map[u_sym]['delta_usd'] += (qty * d * mult * u_p)
-        t_map[u_sym]['theta_usd'] += (qty * th * mult)
-        t_map[u_sym]['delta_puro'] += (qty * d * mult)
-        
+        t_map[u_sym]['d_usd'] += (qty * d * mult * u_p)
+        t_map[u_sym]['th_usd'] += (qty * th * mult)
+        t_map[u_sym]['d_puro'] += (qty * d * mult)
         total_raw_delta += (qty * d * mult)
         total_theta += (qty * th * mult)
         
         detailed_list.append({
-            "Símbolo": p['symbol'], "Tipo": "Opción" if mult==100 else "Acción", 
-            "Qty": qty, "Underlying": u_sym, "Delta": d, "Theta": th, "Price": u_p
+            "Símbolo": p['symbol'], "Tipo": "Opción" if is_option else "Stock", 
+            "Qty": qty, "Underlying": u_sym, "Delta": d, "Theta": th, 
+            "Price": u_p, "Extrinsic": ex, "Exp": m_d.get('expiration_date', 'N/A'),
+            "Strike": m_d.get('strike', 0)
         })
 
     for s, data in t_map.items():
-        total_bwd += (data['delta_usd'] * data['beta']) / spy_p if spy_p > 0 else 0
-        total_abs_exp += abs(data['delta_usd'])
+        total_bwd += (data['d_usd'] * data['beta']) / spy_p if spy_p > 0 else 0
+        total_abs_exp += abs(data['d_usd'])
 
     return net_liq, total_raw_delta, total_bwd, total_theta, total_abs_exp/net_liq, t_map, detailed_list, spy_p
 
-# --- FLUJO DE UI ---
+# --- UI TABS ---
+tab_risk, tab_pmcc = st.tabs(["📊 Riesgo & Historial", "🏗️ PMCC Commander"])
 
 if TRADIER_TOKEN:
-    if st.button("🚀 ACTUALIZAR DASHBOARD"):
+    if st.button("🚀 ACTUALIZAR TODO"):
         res = run_analysis()
         if res:
             nl, rd, bwd, th, lev, r_map, d_list, spy_price = res
             
-            # Actualizar Historial
-            new_entry = {
-                "Timestamp": datetime.now().strftime("%H:%M:%S"),
-                "Net_Liq": nl, "Delta_Neto": rd, "BWD_SPY": bwd, "Theta_Diario": th, "Apalancamiento": lev
-            }
+            # Grabar Historial
+            new_entry = {"Timestamp": datetime.now().strftime("%H:%M:%S"), "Net_Liq": nl, "Delta_Neto": rd, "BWD_SPY": bwd, "Theta_Diario": th, "Apalancamiento": lev}
             st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([new_entry])], ignore_index=True)
 
-            # --- HEADER ---
-            st.markdown(f"### 🏦 Balance Neto: ${nl:,.2f}")
-            c1, c2, c3, c4 = st.columns(4)
-            
-            colors = ["#4ade80" if x >= 0 else "#f87171" for x in [rd, bwd, th]]
-            l_c = "#4ade80" if lev < 1.5 else ("#facc15" if lev < 2.2 else "#f87171")
-            
-            c1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{colors[0]}">{rd:.1f}</div><div class="metric-sub">Deltas Puros</div></div>', unsafe_allow_html=True)
-            c2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{colors[1]}">{bwd:.1f}</div><div class="metric-sub">Riesgo Beta-Ajustado</div></div>', unsafe_allow_html=True)
-            c3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{colors[2]}">${th:.2f}</div><div class="metric-sub">Income Diario</div></div>', unsafe_allow_html=True)
-            c4.markdown(f'<div class="card" style="border-bottom:5px solid {l_c}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value" style="color:{l_c}">{lev:.2f}x</div><div class="metric-sub">Nocional / Cash</div></div>', unsafe_allow_html=True)
-
-            # --- HISTORIAL ---
-            st.divider()
-            st.subheader("📈 Comportamiento de la Sesión")
-            h = st.session_state.history_df
-            if len(h) > 1:
-                row1_c1, row1_c2 = st.columns(2)
-                with row1_c1:
-                    st.caption("💰 Evolución Balance Neto")
-                    st.area_chart(h, x="Timestamp", y="Net_Liq")
-                with row1_c2:
-                    st.caption("⚖️ Evolución BWD (Riesgo SPY)")
-                    st.line_chart(h, x="Timestamp", y="BWD_SPY")
-
-                row2_c1, row2_c2, row2_c3 = st.columns(3)
-                with row2_c1:
-                    st.caption("🎯 Delta Neto")
-                    st.line_chart(h, x="Timestamp", y="Delta_Neto")
-                with row2_c2:
-                    st.caption("⏳ Theta Diario")
-                    st.line_chart(h, x="Timestamp", y="Theta_Diario")
-                with row2_c3:
-                    st.caption("🚀 Apalancamiento")
-                    st.line_chart(h, x="Timestamp", y="Apalancamiento")
+            with tab_risk:
+                st.markdown(f"### 🏦 Balance Neto: ${nl:,.2f}")
+                col1, col2, col3, col4 = st.columns(4)
+                c_rd = "#4ade80" if rd > 0 else "#f87171"
+                c_bwd = "#4ade80" if bwd > 0 else "#f87171"
+                c_th = "#4ade80" if th > 0 else "#f87171"
+                c_lev = "#4ade80" if lev < 1.5 else "#facc15"
                 
-                csv = h.to_csv(index=False).encode('utf-8')
-                st.download_button("💾 Exportar Datos (.csv)", csv, f"session_{datetime.now().strftime('%H%M')}.csv")
+                col1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{c_rd}">{rd:.1f}</div></div>', unsafe_allow_html=True)
+                col2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{c_bwd}">{bwd:.1f}</div></div>', unsafe_allow_html=True)
+                col3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{c_th}">${th:.2f}</div></div>', unsafe_allow_html=True)
+                col4.markdown(f'<div class="card" style="border-bottom:5px solid {c_lev}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value">{lev:.2f}x</div></div>', unsafe_allow_html=True)
 
-            # --- TABLA 1: RIESGO NETO POR ACTIVO ---
-            st.divider()
-            st.subheader("📊 Riesgo Neto por Activo")
-            
-            grouped_rows = []
-            for k, v in r_map.items():
-                grouped_rows.append({
-                    "Activo": k,
-                    "Precio": v['price'],
-                    "Beta": v['beta'],
-                    "Delta Puro": v['delta_puro'],
-                    "Net Delta $": v['delta_usd'],
-                    "Net Theta $": v['theta_usd'],
-                    "BWD": (v['delta_usd'] * v['beta']) / spy_price if spy_price > 0 else 0
-                })
-            
-            df_grouped = pd.DataFrame(grouped_rows).sort_values(by='BWD', key=abs, ascending=False)
-            st.dataframe(df_grouped.style.format({
-                "Precio": "${:.2f}", "Beta": "{:.2f}", "Delta Puro": "{:.1f}",
-                "Net Delta $": "${:,.0f}", "Net Theta $": "${:,.2f}", "BWD": "{:.2f}"
-            }), use_container_width=True)
+                # Gráficos de Historial
+                st.divider()
+                h = st.session_state.history_df
+                if len(h) > 1:
+                    st.subheader("📈 Tendencia de la Sesión")
+                    g1, g2 = st.columns(2)
+                    with g1: st.area_chart(h, x="Timestamp", y="Net_Liq", title="Capital")
+                    with g2: st.line_chart(h, x="Timestamp", y="BWD_SPY", title="Riesgo SPY")
 
-            # --- TABLA 2: DETALLE INDIVIDUAL ---
-            with st.expander("🔍 Ver Detalle de Contratos Individuales"):
-                st.dataframe(pd.DataFrame(d_list).style.format({
-                    "Delta": "{:.4f}", "Theta": "{:.4f}", "Price": "${:.2f}"
-                }), use_container_width=True)
+                # Tabla Agrupada
+                st.subheader("📊 Riesgo Neto por Activo")
+                rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['d_puro'], "Net Delta $": v['d_usd'], "Net Theta $": v['th_usd']} for k,v in r_map.items()]
+                st.dataframe(pd.DataFrame(rows).style.format({"Beta": "{:.2f}", "Net Delta $": "${:,.0f}", "Net Theta $": "${:,.2f}"}), use_container_width=True)
+
+            with tab_pmcc:
+                st.subheader("🏗️ Monitor de Campañas PMCC")
+                df_opts = pd.DataFrame(d_list)
+                df_opts = df_opts[df_opts['Type'] == "Option"]
+                
+                if not df_opts.empty:
+                    for und, group in df_opts.groupby('Underlying'):
+                        long_c = group[(group['Qty'] > 0) & (group['Delta'] > 0.60)]
+                        short_c = group[(group['Qty'] < 0) & (group['Delta'] < 0.45)]
+                        
+                        if not long_c.empty and not short_c.empty:
+                            lc, sc = long_c.iloc[0], short_c.iloc[0]
+                            st.markdown(f'<div class="pmcc-header">🚀 Activo: <b>{und}</b></div>', unsafe_allow_html=True)
+                            p1, p2, p3, p4 = st.columns(4)
+                            p1.write(f"**LEAPS**: K {lc['Strike']} | D: {lc['Delta']:.2f}")
+                            p2.write(f"**SHORT**: K {sc['Strike']} | D: {sc['Delta']:.2f}")
+                            juice = sc['Extrinsic'] * 100 * abs(sc['Qty'])
+                            p3.write(f"**JUGO**: ${juice:.2f}")
+                            if juice < 10: st.warning("🪫 Poco extrínseco.")
+                            p4.write(f"**SALUD**: {(lc['Delta']/abs(sc['Delta'])):.1f}x L/S")
+                            st.divider()
+                else:
+                    st.info("No se detectaron estructuras PMCC en la cartera.")
 else:
-    st.info("👈 Ingresa tu Token para iniciar.")
+    st.info("👈 Ingresa tu Token en la barra lateral.")
+
 
