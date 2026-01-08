@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="Risk & Greeks Commander", page_icon="📈")
+st.set_page_config(layout="wide", page_title="Risk & Greeks Commander Pro", page_icon="🛡️")
 
 # Estilos CSS
 st.markdown("""
@@ -29,32 +29,32 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ Portfolio Intelligence Dashboard")
+st.title("🛡️ Portfolio Intelligence Command Center")
 
-# --- INICIALIZAR HISTORIAL EN MEMORIA ---
+# --- INICIALIZAR HISTORIAL ---
 if 'history_df' not in st.session_state:
     st.session_state.history_df = pd.DataFrame(columns=[
         "Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"
     ])
 
-# --- SIDEBAR: CONEXIÓN ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("📡 Conexión Broker")
     TRADIER_TOKEN = st.text_input("Tradier Access Token", type="password")
     env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
     st.divider()
-    if st.button("🗑️ Borrar Historial de Sesión"):
+    if st.button("🗑️ Reiniciar Sesión"):
         st.session_state.history_df = pd.DataFrame(columns=["Timestamp", "Net_Liq", "Delta_Neto", "BWD_SPY", "Theta_Diario", "Apalancamiento"])
         st.rerun()
+    st.caption("v9.2.0 | Full History Mode")
 
-# --- FUNCIONES DE APOYO ---
+# --- FUNCIONES ---
 def map_to_yahoo(symbol):
     s = symbol.upper().strip()
     if s in ['SPX', 'SPXW', 'SPX.X']: return '^SPX'
     if s in ['NDX', 'NDXW', 'NDX.X']: return '^NDX'
     if s in ['RUT', 'RUTW', 'RUT.X']: return '^RUT'
-    if s in ['VIX', 'VIX.X']: return '^VIX'
     return s.replace('/', '-')
 
 def get_underlying_symbol(symbol):
@@ -66,160 +66,127 @@ def get_headers():
     return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
 
 @st.cache_data(ttl=3600)
-def calculate_beta_individual(ticker, spy_returns):
+def calculate_beta(ticker, spy_returns):
     if ticker in ['BIL', 'SGOV', 'SHV', 'USFR']: return 0.0
     try:
-        stock_raw = yf.download(map_to_yahoo(ticker), period="1y", progress=False)
-        if stock_raw.empty: return 1.0
-        # Limpieza de Timezone
-        stock_raw.index = stock_raw.index.tz_localize(None)
-        
-        # Manejo de columnas para yfinance nuevo
-        col = 'Adj Close' if 'Adj Close' in stock_raw.columns else 'Close'
-        stock_ret = stock_raw[col].pct_change().dropna()
-        
-        aligned = pd.concat([stock_ret, spy_returns], axis=1, join='inner').dropna()
+        stock = yf.download(map_to_yahoo(ticker), period="1y", progress=False)
+        stock.index = stock.index.tz_localize(None)
+        col = 'Adj Close' if 'Adj Close' in stock.columns else 'Close'
+        ret = stock[col].pct_change().dropna()
+        aligned = pd.concat([ret, spy_returns], axis=1, join='inner').dropna()
         return aligned.iloc[:,0].cov(aligned.iloc[:,1]) / aligned.iloc[:,1].var()
     except: return 1.0
 
-# --- LÓGICA DE DATOS ---
-
+# --- CÁLCULOS ---
 def run_analysis():
-    # 1. Obtener Cuenta
-    r_profile = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
-    if r_profile.status_code != 200: return None
-    
-    acct = r_profile.json()['profile']['account']
+    # Perfil y Balance
+    r_p = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
+    if r_p.status_code != 200: return None
+    acct = r_p.json()['profile']['account']
     acct_id = acct[0]['account_number'] if isinstance(acct, list) else acct['account_number']
-    
-    r_bal = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
-    net_liq = float(r_bal.json()['balances']['total_equity'])
+    r_b = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
+    net_liq = float(r_b.json()['balances']['total_equity'])
 
-    # 2. Obtener Posiciones
+    # Posiciones
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
-    raw_pos = r_pos.json().get('positions', {}).get('position', [])
-    if isinstance(raw_pos, dict): raw_pos = [raw_pos]
-    if not raw_pos: return net_liq, 0, 0, 0, 0, {}
-    
-    symbols_to_fetch = ["SPY"]
-    portfolio = []
-    for p in raw_pos:
-        u_sym = get_underlying_symbol(p['symbol'])
-        portfolio.append({"Symbol": p['symbol'], "Qty": float(p['quantity']), "Underlying": u_sym, "Type": "Option" if len(p['symbol']) > 5 else "Stock"})
-        symbols_to_fetch.extend([p['symbol'], u_sym])
+    raw = r_pos.json().get('positions', {}).get('position', [])
+    if isinstance(raw, dict): raw = [raw]
+    if not raw: return net_liq, 0, 0, 0, 0, {}
 
-    # 3. Datos de Mercado (Tradier)
-    unique_syms = ",".join(list(set(symbols_to_fetch)))
-    r_qs = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': unique_syms, 'greeks': 'true'}, headers=get_headers())
-    quotes = r_qs.json().get('quotes', {}).get('quote', [])
-    if isinstance(quotes, dict): quotes = [quotes]
-    
-    market_map = {q['symbol']: q for q in quotes}
-    spy_price = float(market_map.get('SPY', {}).get('last', 0))
+    # Market Data
+    syms = ["SPY"] + [p['symbol'] for p in raw] + [get_underlying_symbol(p['symbol']) for p in raw]
+    r_q = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': ",".join(list(set(syms))), 'greeks': 'true'}, headers=get_headers())
+    m_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])}
+    spy_p = float(m_map.get('SPY', {}).get('last', 0))
 
-    # 4. Datos de Yahoo (SPY una sola vez)
+    # Yahoo Data
     spy_df = yf.download("SPY", period="1y", progress=False)
-    if spy_df.empty:
-        st.error("Yahoo Finance bloqueó la petición (Rate Limit). Reintenta en 1 minuto.")
-        st.stop()
+    spy_ret = (spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']).tz_localize(None).pct_change().dropna()
     
-    # Extraer precios de SPY correctamente
-    spy_prices = spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']
-    spy_prices.index = spy_prices.index.tz_localize(None)
-    spy_returns = spy_prices.pct_change().dropna()
+    # Greeks & Netting
+    rd_tot, th_tot, exp_tot, bwd_tot = 0, 0, 0, 0
+    t_map = {}
     
-    # Calcular Betas
-    underlyings = list(set([p['Underlying'] for p in portfolio]))
-    betas = {t: calculate_beta_individual(t, spy_returns) for t in underlyings}
-
-    # 5. Cálculos
-    total_raw_delta = 0
-    total_theta = 0
-    ticker_risk = {}
-
-    for p in portfolio:
-        m_data = market_map.get(p['Symbol'], {})
-        u_price = float(market_map.get(p['Underlying'], {}).get('last', 0))
-        delta = float(m_data.get('greeks', {}).get('delta', 1.0 if p['Type']=="Stock" else 0))
-        theta = float(m_data.get('greeks', {}).get('theta', 0))
+    for p in raw:
+        qty = float(p['quantity'])
+        u_sym = get_underlying_symbol(p['symbol'])
+        m_d = m_map.get(p['symbol'], {})
+        u_p = float(m_map.get(u_sym, {}).get('last', 0))
+        mult = 100 if len(p['symbol']) > 5 else 1
         
-        mult = 100 if p['Type'] == "Option" else 1
-        pos_raw_delta = p['Qty'] * delta * mult
-        pos_delta_dollars = pos_raw_delta * u_price
-        pos_theta_dollars = p['Qty'] * theta * mult
+        d = float(m_d.get('greeks', {}).get('delta', 1.0 if mult==1 else 0))
+        th = float(m_d.get('greeks', {}).get('theta', 0))
         
-        total_raw_delta += pos_raw_delta
-        total_theta += pos_theta_dollars
+        if u_sym not in t_map:
+            t_map[u_sym] = {'d_usd': 0, 'th_usd': 0, 'beta': calculate_beta(u_sym, spy_ret), 'price': u_p}
         
-        if p['Underlying'] not in ticker_risk:
-            ticker_risk[p['Underlying']] = {'delta_usd': 0, 'theta_usd': 0, 'beta': betas.get(p['Underlying'], 1.0), 'price': u_price}
-        ticker_risk[p['Underlying']]['delta_usd'] += pos_delta_dollars
-        ticker_risk[p['Underlying']]['theta_usd'] += pos_theta_dollars
+        t_map[u_sym]['d_usd'] += (qty * d * mult * u_p)
+        t_map[u_sym]['th_usd'] += (qty * th * mult)
+        rd_tot += (qty * d * mult)
+        th_tot += (qty * th * mult)
 
-    # 6. Agregación Final
-    total_bwd = 0
-    total_abs_exposure = 0
-    for sym, data in ticker_risk.items():
-        bwd = (data['delta_usd'] * data['beta']) / spy_price if spy_price > 0 else 0
-        total_bwd += bwd
-        total_abs_exposure += abs(data['delta_usd'])
-    
-    leverage = total_abs_exposure / net_liq if net_liq > 0 else 0
+    for s, data in t_map.items():
+        bwd_tot += (data['d_usd'] * data['beta']) / spy_p if spy_p > 0 else 0
+        exp_tot += abs(data['d_usd'])
 
-    return net_liq, total_raw_delta, total_bwd, total_theta, leverage, ticker_risk
+    return net_liq, rd_tot, bwd_tot, th_tot, exp_tot/net_liq, t_map
 
-# --- FLUJO DE UI ---
-
+# --- UI ---
 if TRADIER_TOKEN:
     if st.button("🔄 ACTUALIZAR DASHBOARD"):
         res = run_analysis()
         if res:
-            nl, rd, bwd, th, lev, risk_map = res
-            
-            # Guardar en Historial
-            new_entry = {
+            nl, rd, bwd, th, lev, r_map = res
+            st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([{
                 "Timestamp": datetime.now().strftime("%H:%M:%S"),
                 "Net_Liq": nl, "Delta_Neto": rd, "BWD_SPY": bwd, "Theta_Diario": th, "Apalancamiento": lev
-            }
-            st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([new_entry])], ignore_index=True)
+            }])], ignore_index=True)
 
-            # KPIs
+            # --- HEADER ---
             st.markdown(f"### 🏦 Balance Neto: ${nl:,.2f}")
-            col1, col2, col3, col4 = st.columns(4)
-            
+            c1, c2, c3, c4 = st.columns(4)
             colors = ["#4ade80" if x >= 0 else "#f87171" for x in [rd, bwd, th]]
-            l_c = "#4ade80" if lev < 1.5 else "#facc15"
-            
-            col1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{colors[0]}">{rd:.1f}</div></div>', unsafe_allow_html=True)
-            col2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{colors[1]}">{bwd:.1f}</div></div>', unsafe_allow_html=True)
-            col3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{colors[2]}">${th:.2f}</div></div>', unsafe_allow_html=True)
-            col4.markdown(f'<div class="card" style="border-bottom:5px solid {l_c}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value" style="color:{l_c}">{lev:.2f}x</div></div>', unsafe_allow_html=True)
+            c1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{colors[0]}">{rd:.1f}</div></div>', unsafe_allow_html=True)
+            c2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{colors[1]}">{bwd:.1f}</div></div>', unsafe_allow_html=True)
+            c3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{colors[2]}">${th:.2f}</div></div>', unsafe_allow_html=True)
+            c4.markdown(f'<div class="card" style="border-bottom:5px solid {"#4ade80" if lev < 1.5 else "#facc15"}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value">{lev:.2f}x</div></div>', unsafe_allow_html=True)
 
-            # --- SECCIÓN DE HISTORIAL ---
+            # --- HISTORIAL COMPLETO ---
             st.divider()
-            st.subheader("📈 Comportamiento en la Sesión")
+            st.subheader("📈 Comportamiento de la Sesión")
+            h = st.session_state.history_df
             
-            hist = st.session_state.history_df
-            if len(hist) > 1:
-                h_col1, h_col2 = st.columns(2)
-                with h_col1:
-                    st.caption("Evolución del BWD (Riesgo Direccional)")
-                    st.line_chart(hist, x="Timestamp", y="BWD_SPY")
-                with h_col2:
-                    st.caption("Evolución del Theta (Renta Diaria)")
-                    st.line_chart(hist, x="Timestamp", y="Theta_Diario")
+            if len(h) > 1:
+                # Fila 1: Balance y Riesgo SPY
+                row1_col1, row1_col2 = st.columns(2)
+                with row1_col1:
+                    st.caption("💰 Evolución Balance Neto")
+                    st.area_chart(h, x="Timestamp", y="Net_Liq", color="#00d4ff")
+                with row1_col2:
+                    st.caption("⚖️ Evolución BWD (Riesgo SPY)")
+                    st.line_chart(h, x="Timestamp", y="BWD_SPY", color="#4ade80")
+
+                # Fila 2: Delta, Theta y Apalancamiento
+                row2_col1, row2_col2, row2_col3 = st.columns(3)
+                with row2_col1:
+                    st.caption("🎯 Delta Neto (Pure)")
+                    st.line_chart(h, x="Timestamp", y="Delta_Neto")
+                with row2_col2:
+                    st.caption("⏳ Theta (Renta)")
+                    st.line_chart(h, x="Timestamp", y="Theta_Diario")
+                with row2_col3:
+                    st.caption("🚀 Apalancamiento")
+                    st.line_chart(h, x="Timestamp", y="Apalancamiento")
                 
-                csv = hist.to_csv(index=False).encode('utf-8')
-                st.download_button("💾 Guardar Datos del Día (CSV)", csv, f"log_trading_{datetime.now().strftime('%Y%m%d')}.csv")
-            else:
-                st.info("Presiona 'Actualizar' varias veces para ver la tendencia.")
-
-            # Tablas de Riesgo
+                csv = h.to_csv(index=False).encode('utf-8')
+                st.download_button("💾 Exportar Datos (.csv)", csv, f"session_{datetime.now().strftime('%H%M')}.csv")
+            
+            # --- TABLA DE ACTIVOS ---
             st.divider()
-            st.subheader("Desglose por Activo")
-            st.table(pd.DataFrame([{"Activo": k, "Beta": f"{v['beta']:.2f}", "Delta $": f"{v['delta_usd']:,.0f}", "Theta $": f"{v['theta_usd']:.2f}"} for k,v in risk_map.items()]))
-        else:
-            st.error("No se pudo obtener información de la cuenta. Revisa tu token.")
+            st.subheader("Riesgo por Activo")
+            df_assets = pd.DataFrame([{"Activo": k, "Beta": f"{v['beta']:.2f}", "Delta $": f"{v['delta_usd']:,.0f}", "Theta $": f"{v['th_usd']:.2f}"} for k,v in r_map.items()])
+            st.table(df_assets)
 else:
-    st.info("👈 Ingresa tu Token para comenzar.")
+    st.info("👈 Ingresa tu Token para iniciar.")
+
 
