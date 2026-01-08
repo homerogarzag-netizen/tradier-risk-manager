@@ -70,8 +70,14 @@ def calculate_beta_individual(ticker, spy_returns):
     if ticker in ['BIL', 'SGOV', 'SHV', 'USFR']: return 0.0
     try:
         stock_raw = yf.download(map_to_yahoo(ticker), period="1y", progress=False)
+        if stock_raw.empty: return 1.0
+        # Limpieza de Timezone
         stock_raw.index = stock_raw.index.tz_localize(None)
-        stock_ret = stock_raw['Adj Close'].pct_change().dropna()
+        
+        # Manejo de columnas para yfinance nuevo
+        col = 'Adj Close' if 'Adj Close' in stock_raw.columns else 'Close'
+        stock_ret = stock_raw[col].pct_change().dropna()
+        
         aligned = pd.concat([stock_ret, spy_returns], axis=1, join='inner').dropna()
         return aligned.iloc[:,0].cov(aligned.iloc[:,1]) / aligned.iloc[:,1].var()
     except: return 1.0
@@ -79,10 +85,13 @@ def calculate_beta_individual(ticker, spy_returns):
 # --- LÓGICA DE DATOS ---
 
 def run_analysis():
-    # 1. Obtener Balance
+    # 1. Obtener Cuenta
     r_profile = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
+    if r_profile.status_code != 200: return None
+    
     acct = r_profile.json()['profile']['account']
     acct_id = acct[0]['account_number'] if isinstance(acct, list) else acct['account_number']
+    
     r_bal = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
     net_liq = float(r_bal.json()['balances']['total_equity'])
 
@@ -90,6 +99,7 @@ def run_analysis():
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
     raw_pos = r_pos.json().get('positions', {}).get('position', [])
     if isinstance(raw_pos, dict): raw_pos = [raw_pos]
+    if not raw_pos: return net_liq, 0, 0, 0, 0, {}
     
     symbols_to_fetch = ["SPY"]
     portfolio = []
@@ -98,7 +108,7 @@ def run_analysis():
         portfolio.append({"Symbol": p['symbol'], "Qty": float(p['quantity']), "Underlying": u_sym, "Type": "Option" if len(p['symbol']) > 5 else "Stock"})
         symbols_to_fetch.extend([p['symbol'], u_sym])
 
-    # 3. Batch Quotes (Deltas/Thetas/Precios)
+    # 3. Datos de Mercado (Tradier)
     unique_syms = ",".join(list(set(symbols_to_fetch)))
     r_qs = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': unique_syms, 'greeks': 'true'}, headers=get_headers())
     quotes = r_qs.json().get('quotes', {}).get('quote', [])
@@ -107,15 +117,22 @@ def run_analysis():
     market_map = {q['symbol']: q for q in quotes}
     spy_price = float(market_map.get('SPY', {}).get('last', 0))
 
-    # 4. Betas
-    spy_returns = yf.download("SPY", period="1y", progress=False)['Adj Close'].index.tz_localize(None) # Trick for cache
-    spy_returns = yf.download("SPY", period="1y", progress=False)['Adj Close'].index.tz_localize(None)
-    spy_data = yf.download("SPY", period="1y", progress=False)['Adj Close'].tz_localize(None).pct_change().dropna()
+    # 4. Datos de Yahoo (SPY una sola vez)
+    spy_df = yf.download("SPY", period="1y", progress=False)
+    if spy_df.empty:
+        st.error("Yahoo Finance bloqueó la petición (Rate Limit). Reintenta en 1 minuto.")
+        st.stop()
     
+    # Extraer precios de SPY correctamente
+    spy_prices = spy_df['Adj Close'] if 'Adj Close' in spy_df.columns else spy_df['Close']
+    spy_prices.index = spy_prices.index.tz_localize(None)
+    spy_returns = spy_prices.pct_change().dropna()
+    
+    # Calcular Betas
     underlyings = list(set([p['Underlying'] for p in portfolio]))
-    betas = {t: calculate_beta_individual(t, spy_data) for t in underlyings}
+    betas = {t: calculate_beta_individual(t, spy_returns) for t in underlyings}
 
-    # 5. Cálculos de Netting
+    # 5. Cálculos
     total_raw_delta = 0
     total_theta = 0
     ticker_risk = {}
@@ -155,8 +172,9 @@ def run_analysis():
 
 if TRADIER_TOKEN:
     if st.button("🔄 ACTUALIZAR DASHBOARD"):
-        with st.spinner("Sincronizando..."):
-            nl, rd, bwd, th, lev, risk_map = run_analysis()
+        res = run_analysis()
+        if res:
+            nl, rd, bwd, th, lev, risk_map = res
             
             # Guardar en Historial
             new_entry = {
@@ -167,15 +185,15 @@ if TRADIER_TOKEN:
 
             # KPIs
             st.markdown(f"### 🏦 Balance Neto: ${nl:,.2f}")
-            c1, c2, c3, c4 = st.columns(4)
+            col1, col2, col3, col4 = st.columns(4)
             
             colors = ["#4ade80" if x >= 0 else "#f87171" for x in [rd, bwd, th]]
             l_c = "#4ade80" if lev < 1.5 else "#facc15"
             
-            c1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{colors[0]}">{rd:.1f}</div></div>', unsafe_allow_html=True)
-            c2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{colors[1]}">{bwd:.1f}</div></div>', unsafe_allow_html=True)
-            c3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{colors[2]}">${th:.2f}</div></div>', unsafe_allow_html=True)
-            c4.markdown(f'<div class="card" style="border-bottom:5px solid {l_c}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value" style="color:{l_c}">{lev:.2f}x</div></div>', unsafe_allow_html=True)
+            col1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{colors[0]}">{rd:.1f}</div></div>', unsafe_allow_html=True)
+            col2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{colors[1]}">{bwd:.1f}</div></div>', unsafe_allow_html=True)
+            col3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{colors[2]}">${th:.2f}</div></div>', unsafe_allow_html=True)
+            col4.markdown(f'<div class="card" style="border-bottom:5px solid {l_c}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value" style="color:{l_c}">{lev:.2f}x</div></div>', unsafe_allow_html=True)
 
             # --- SECCIÓN DE HISTORIAL ---
             st.divider()
@@ -191,7 +209,6 @@ if TRADIER_TOKEN:
                     st.caption("Evolución del Theta (Renta Diaria)")
                     st.line_chart(hist, x="Timestamp", y="Theta_Diario")
                 
-                # Botón de descarga
                 csv = hist.to_csv(index=False).encode('utf-8')
                 st.download_button("💾 Guardar Datos del Día (CSV)", csv, f"log_trading_{datetime.now().strftime('%Y%m%d')}.csv")
             else:
@@ -200,7 +217,9 @@ if TRADIER_TOKEN:
             # Tablas de Riesgo
             st.divider()
             st.subheader("Desglose por Activo")
-            st.table(pd.DataFrame([{"Activo": k, "Beta": v['beta'], "Delta $": v['delta_usd'], "Theta $": v['theta_usd']} for k,v in risk_map.items()]))
-
+            st.table(pd.DataFrame([{"Activo": k, "Beta": f"{v['beta']:.2f}", "Delta $": f"{v['delta_usd']:,.0f}", "Theta $": f"{v['theta_usd']:.2f}"} for k,v in risk_map.items()]))
+        else:
+            st.error("No se pudo obtener información de la cuenta. Revisa tu token.")
 else:
     st.info("👈 Ingresa tu Token para comenzar.")
+
