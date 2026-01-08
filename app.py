@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 import re
-import time 
+import time
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
 st.set_page_config(layout="wide", page_title="Income Trader Risk Dashboard", page_icon="🛡️")
@@ -27,16 +27,16 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🛡️ Income Trader: Risk & Greeks Dashboard")
+st.title("🛡️ Income Trader: Risk & Greeks Manager")
 
 # --- SIDEBAR: CONEXIÓN ---
 with st.sidebar:
     st.header("📡 Conexión Broker")
-    TRADIER_TOKEN = st.text_input("Tradier Access Token", type="password", placeholder="Ingresa tu token aquí...")
+    TRADIER_TOKEN = st.text_input("Tradier Access Token", type="password", placeholder="Ingresa tu token...")
     env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
     st.divider()
-    st.caption("v8.1.0 | Dashboard Live")
+    st.caption("v8.2.0 | Dashboard Stable")
 
 # --- FUNCIONES AUXILIARES ---
 def map_to_yahoo(symbol):
@@ -72,7 +72,7 @@ def get_portfolio_data(acct_id):
     try:
         r = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
         data = r.json()
-        if 'positions' not in data or data['positions'] == 'null': return [], 0
+        if 'positions' not in data or data['positions'] == 'null' or data['positions'] is None: return [], 0
         
         raw_pos = data['positions']['position']
         if isinstance(raw_pos, dict): raw_pos = [raw_pos]
@@ -144,7 +144,7 @@ def calculate_beta_individual(ticker, spy_returns):
 
 # --- LÓGICA PRINCIPAL ---
 if TRADIER_TOKEN:
-    if st.button("🚀 ACTUALIZAR DASHBOARD"):
+    if st.button("🔄 ACTUALIZAR DASHBOARD"):
         with st.spinner("Analizando riesgo institucional..."):
             acct_id, net_liq = get_account_balance()
             if acct_id:
@@ -154,9 +154,12 @@ if TRADIER_TOKEN:
                     spy_returns = clean_data(spy_raw).pct_change().dropna()
                     underlyings = list(set([p['Underlying'] for p in positions]))
                     betas = {t: calculate_beta_individual(t, spy_returns) for t in underlyings}
+                    
                     ticker_risk = {}
-                    total_raw_delta = 0
+                    detailed_rows = []
+                    total_portfolio_raw_delta = 0
                     total_portfolio_theta = 0
+                    
                     for p in positions:
                         u_sym = p['Underlying']
                         u_price = p['Underlying_Price']
@@ -164,16 +167,21 @@ if TRADIER_TOKEN:
                         pos_delta_dollars = p['Qty'] * p['Delta'] * mult * u_price
                         pos_raw_delta = p['Qty'] * p['Delta'] * mult
                         pos_theta_dollars = p['Qty'] * p['Theta'] * mult
-                        total_raw_delta += pos_raw_delta
+                        
+                        total_portfolio_raw_delta += pos_raw_delta
                         total_portfolio_theta += pos_theta_dollars
+                        
                         if u_sym not in ticker_risk:
                             ticker_risk[u_sym] = {'net_delta_dollars': 0.0, 'net_theta': 0.0, 'net_raw_delta': 0.0, 'price': u_price, 'beta': betas.get(u_sym, 1.0)}
+                        
                         ticker_risk[u_sym]['net_delta_dollars'] += pos_delta_dollars
                         ticker_risk[u_sym]['net_theta'] += pos_theta_dollars
                         ticker_risk[u_sym]['net_raw_delta'] += pos_raw_delta
+                        detailed_rows.append(p)
+
+                    grouped_data = []
                     total_bwd = 0
                     total_net_exposure_abs = 0
-                    grouped_data = []
                     for sym, data in ticker_risk.items():
                         bwd = (data['net_delta_dollars'] * data['beta']) / spy_price if spy_price > 0 else 0
                         total_bwd += bwd
@@ -183,4 +191,30 @@ if TRADIER_TOKEN:
                             "Delta Puro": data['net_raw_delta'], "Net Delta $": data['net_delta_dollars'],
                             "Net Theta $": data['net_theta'], "BWD": bwd
                         })
-                    leverage = total_net_exposure_abs / net_liq if net_liq
+                    
+                    leverage = total_net_exposure_abs / net_liq if net_liq > 0 else 0
+
+                    st.markdown(f"### 🏦 Balance Neto: ${net_liq:,.2f}")
+                    col1, col2, col3, col4 = st.columns(4)
+                    d_c = "#4ade80" if total_portfolio_raw_delta > 0 else "#f87171"
+                    col1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value" style="color:{d_c}">{total_portfolio_raw_delta:.2f}</div><div class="metric-sub">Suma Deltas Puros</div></div>', unsafe_allow_html=True)
+                    b_c = "#4ade80" if total_bwd > 0 else "#f87171"
+                    col2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value" style="color:{b_c}">{total_bwd:.2f}</div><div class="metric-sub">Riesgo vs SPY</div></div>', unsafe_allow_html=True)
+                    t_c = "#4ade80" if total_portfolio_theta > 0 else "#f87171"
+                    col3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:{t_c}">${total_portfolio_theta:.2f}</div><div class="metric-sub">Ingreso Diario</div></div>', unsafe_allow_html=True)
+                    l_c = "#4ade80" if leverage < 1.5 else ("#facc15" if leverage < 2.5 else "#f87171")
+                    col4.markdown(f'<div class="card" style="border-bottom: 5px solid {l_c}"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value" style="color:{l_c}">{leverage:.2f}x</div><div class="metric-sub">Nocional / Cash</div></div>', unsafe_allow_html=True)
+
+                    st.divider()
+                    st.subheader("Riesgo Neto por Activo")
+                    df_g = pd.DataFrame(grouped_data).sort_values(by='BWD', key=abs, ascending=False)
+                    st.dataframe(df_g.style.format({"Precio": "${:.2f}", "Beta": "{:.2f}", "Delta Puro": "{:.1f}", "Net Delta $": "${:,.0f}", "Net Theta $": "${:,.2f}", "BWD": "{:.2f}"}), use_container_width=True)
+
+                    with st.expander("Ver Detalle de Contratos"):
+                        st.dataframe(pd.DataFrame(detailed_rows).style.format({"Underlying_Price": "${:.2f}", "Delta": "{:.4f}", "Theta": "{:.4f}"}), use_container_width=True)
+                else:
+                    st.warning("No hay posiciones abiertas.")
+            else:
+                st.error("Error de conexión. Revisa tu Token.")
+else:
+    st.info("👈 Ingresa tu **Tradier Access Token** en la barra lateral para sincronizar tu cartera.")
