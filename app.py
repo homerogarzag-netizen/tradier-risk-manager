@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="PMCC CEO Command Center", page_icon="🛡️")
+st.set_page_config(layout="wide", page_title="PMCC Master Accountant Pro", page_icon="🛡️")
 
 # --- DISEÑO UI PREMIUM (CSS) ---
 st.markdown("""
@@ -52,7 +52,7 @@ with st.sidebar:
     env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
     st.divider()
-    st.caption("v17.1.0 | CEO UI Final Fix")
+    st.caption("v17.2.0 | Stable Core Restoration")
 
 # --- FUNCIONES DE APOYO ---
 def get_headers(): return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
@@ -136,7 +136,6 @@ def run_master_analysis():
 
     for p in raw_pos:
         sym = p['symbol']
-        qty = float(p['quantity'])
         u_sym = get_underlying_symbol(sym)
         m_d = m_map.get(sym, {})
         u_p = float(m_map.get(u_sym, {}).get('last', 0))
@@ -147,20 +146,30 @@ def run_master_analysis():
         th = float(m_d.get('greeks', {}).get('theta', 0))
         ex = float(m_d.get('greeks', {}).get('extrinsic', 0))
         
+        # Calcular DTE
+        dte = 0
+        if is_opt and m_d.get('expiration_date'):
+            exp_dt = datetime.strptime(m_d.get('expiration_date'), '%Y-%m-%d')
+            dte = (exp_dt - datetime.now()).days
+
         if u_sym not in t_map:
             t_map[u_sym] = {'d_usd': 0, 'th_usd': 0, 'd_puro': 0, 'beta': get_beta(u_sym, spy_ret), 'price': u_p}
         
-        t_map[u_sym]['d_usd'] += (qty * d * mult * u_p)
-        t_map[u_sym]['th_usd'] += (qty * th * mult)
-        t_map[u_sym]['d_puro'] += (qty * d * mult)
-        total_rd += (qty * d * mult)
-        total_th += (qty * th * mult)
+        t_map[u_sym]['d_usd'] += (qty_val := float(p['quantity'])) * d * mult * u_p
+        t_map[u_sym]['th_usd'] += (qty_val * th * mult)
+        t_map[u_sym]['d_puro'] += (qty_val * d * mult)
+        total_rd += (qty_val * d * mult)
+        total_th += (qty_val * th * mult)
         
+        market_val = qty_val * float(m_d.get('last', 0)) * mult
+        cost_val = abs(float(p.get('cost_basis', 0)))
+
         detailed_positions.append({
-            "Symbol": sym, "Qty": qty, "Underlying": u_sym, "Type": "option" if is_opt else "stock",
+            "Symbol": sym, "Qty": qty_val, "Underlying": u_sym, "Type": "option" if is_opt else "stock",
             "Delta": d, "Theta": th, "Price": u_p, "Extrinsic": ex, "Strike": m_d.get('strike', 0),
-            "Exp": m_d.get('expiration_date', 'N/A'), "Cost": abs(float(p.get('cost_basis', 0))),
-            "Acquired": p.get('date_acquired', 'N/A')[:10], "Last": float(m_d.get('last', 0))
+            "Exp": m_d.get('expiration_date', 'N/A'), "Cost": cost_val,
+            "Acquired": p.get('date_acquired', 'N/A')[:10], "Last": float(m_d.get('last', 0)),
+            "Value": market_val, "P_L": market_val - cost_val, "DTE": dte
         })
 
     for s, data in t_map.items():
@@ -174,13 +183,14 @@ def run_master_analysis():
         "gl": gl_data, "spy_p": spy_p
     }
 
-# --- UI ---
+# --- UI TABS ---
 tab_risk, tab_ceo = st.tabs(["📊 Riesgo & Gráficos", "🏗️ CEO PMCC Accountant"])
 
 if TRADIER_TOKEN:
     if st.button("🚀 ACTUALIZAR COMMAND CENTER"):
         d = run_master_analysis()
         if d:
+            # Snapshot Historial
             new_h = {"Timestamp": datetime.now().strftime("%H:%M:%S"), "Net_Liq": d['nl'], "Delta_Neto": d['rd'], "BWD_SPY": d['bwd'], "Theta_Diario": d['th'], "Apalancamiento": d['lev']/d['nl']}
             st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([new_h])], ignore_index=True)
 
@@ -195,17 +205,15 @@ if TRADIER_TOKEN:
                 st.divider()
                 h = st.session_state.history_df
                 if len(h) > 1:
+                    st.subheader("📈 Tendencias de la Sesión")
                     g1, g2 = st.columns(2)
                     g1.write("**Capital ($)**"); g1.area_chart(h, x="Timestamp", y="Net_Liq")
                     g2.write("**Riesgo BWD**"); g2.line_chart(h, x="Timestamp", y="BWD_SPY")
 
-                st.subheader("📊 Riesgo por Activo")
-                r_rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['d_puro'], "Net Delta $": v['d_usd'], "BWD": (v['d_usd']*v['beta'])/d['spy_p']} for k,v in d['risk'].items()]
-                st.dataframe(pd.DataFrame(r_rows).sort_values(by='BWD', ascending=False), use_container_width=True)
-
             with tab_ceo:
                 st.subheader("📋 Contabilidad Forense de Campañas PMCC")
                 df_det = pd.DataFrame(d['detailed'])
+                
                 for und, group in df_det[df_det['Type'] == "option"].groupby('Underlying'):
                     longs = group[(group['Qty'] > 0) & (group['Delta'].abs() > 0.55)]
                     if not longs.empty:
@@ -224,29 +232,39 @@ if TRADIER_TOKEN:
                                         closed_list.append({"Fecha": close_dt.strftime('%Y-%m-%d'), "Strike": strike, "P/L": gain})
 
                         l_cost = longs['Cost'].sum()
-                        l_val = (longs['Last'] * longs['Qty'] * 100).sum()
+                        l_val = longs['Value'].sum()
                         net_inc = (l_val - l_cost) + realized_income
                         roi = (net_inc / l_cost * 100) if l_cost > 0 else 0
 
                         st.markdown(f'<div class="section-header">SYMBOL: {und} (Spot: ${group["Price"].iloc[0]:.2f})</div>', unsafe_allow_html=True)
+                        
                         cc1, cc2, cc3, cc4, cc5 = st.columns(5)
                         cc1.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">COSTO LEAPS</p><p class="kpi-value">${l_cost:,.2f}</p></div>', unsafe_allow_html=True)
                         cc2.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${l_val:,.2f}</p></div>', unsafe_allow_html=True)
                         cc3.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">CC REALIZADO</p><p class="kpi-value" style="color:#4ade80">${realized_income:,.2f}</p></div>', unsafe_allow_html=True)
                         cc4.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">NET INCOME</p><p class="kpi-value">${net_inc:,.2f}</p></div>', unsafe_allow_html=True)
-                        cc5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{"#4ade80" if roi > 0 else "#f87171"}">{roi:.1f}%</p></div>', unsafe_allow_html=True)
+                        
+                        roi_col = "#4ade80" if roi >= 0 else "#f87171"
+                        cc5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{roi_col}">{roi:.1f}%</p></div>', unsafe_allow_html=True)
                         
                         st.write("### 🏛️ CORE POSITION (LEAPS)")
-                        st.table(longs[['Exp', 'Strike', 'Qty', 'Delta']])
+                        # Restauración de las 7 columnas: Adquirido, Exp, Strike, Qty, Cost, Value, P/L
+                        core_table = longs[['Acquired', 'Exp', 'Strike', 'Qty', 'Cost', 'Value', 'P_L']]
+                        core_table.columns = ['Adquirido', 'Exp', 'Strike', 'Qty', 'Cost', 'Value', 'P/L']
+                        st.table(core_table.style.format({"Cost": "${:,.2f}", "Value": "${:,.2f}", "P/L": "${:,.2f}"}))
                         
                         shorts = group[(group['Qty'] < 0) & (group['Delta'].abs() < 0.50)]
                         if not shorts.empty:
                             sc = shorts.iloc[0]
-                            j = sc['Extrinsic'] * 100 * abs(sc['Qty'])
-                            st.write(f"### 🥤 Active Short: Strike {sc['Strike']} | **Jugo: ${j:.2f}**")
+                            # Restauración de DTE y Extrínseco ($)
+                            st.write(f"### 🥤 MONITOR DE JUGO: Strike {sc['Strike']} | DTE: {sc['DTE']} | **Extrínseco: ${sc['Extrinsic']:.2f}**")
+                            if sc['Extrinsic'] < 0.20: st.error("🚨 TIEMPO DE ROLEAR")
+                        
                         if closed_list:
-                            with st.expander("Ver Historial"): st.table(pd.DataFrame(closed_list))
+                            with st.expander("Ver Historial Cerrado"): st.table(pd.DataFrame(closed_list))
                         st.divider()
+
+            with st.expander("Ver Detalle Crudo"): st.dataframe(df_det)
 else:
     st.info("👈 Ingresa tu Token de Tradier.")
 
