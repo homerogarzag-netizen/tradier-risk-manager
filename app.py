@@ -253,3 +253,4 @@ if TRADIER_TOKEN:
             with st.expander("Ver Detalle Crudo"): st.dataframe(df_det)
 else:
     st.info("👈 Ingresa tu Token de Tradier.")
+
