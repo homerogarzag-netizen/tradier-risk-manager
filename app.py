@@ -9,23 +9,19 @@ import plotly.graph_objects as go
 from datetime import datetime
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="PMCC Master Accountant Pro", page_icon="🛡️")
+st.set_page_config(layout="wide", page_title="PMCC CEO Command Center Pro", page_icon="🛡️")
 
 # --- DISEÑO UI PREMIUM (CSS) ---
 st.markdown("""
     <style>
     .stApp {background-color: #0e1117;}
-    /* Tarjetas de KPI */
     .card {
         background-color: #1f2937; 
         padding: 20px; border-radius: 12px; 
         border: 1px solid #374151; text-align: center; height: 140px;
-        box-shadow: 2px 2px 10px rgba(0,0,0,0.3);
     }
     .metric-label {color: #9ca3af; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; margin-bottom: 8px;}
     .metric-value {font-size: 1.5rem; font-weight: bold; margin: 0;}
-    
-    /* Encabezados de Sección */
     .section-header {
         background: linear-gradient(90deg, #238636 0%, #2ea043 100%);
         color: white; padding: 10px 20px; 
@@ -33,7 +29,7 @@ st.markdown("""
     }
     .summary-card-pmcc {
         background-color: #161b22; border: 1px solid #30363d;
-        padding: 15px; border-radius: 8px; text-align: center; height: 120px;
+        padding: 15px; border-radius: 8px; text-align: center; height: 125px;
     }
     .roi-val {font-size: 1.6rem; font-weight: bold;}
     </style>
@@ -52,7 +48,7 @@ with st.sidebar:
     env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
     st.divider()
-    st.caption("v17.2.0 | Stable Core Restoration")
+    st.caption("v17.3.0 | Full History & Juice Fix")
 
 # --- FUNCIONES DE APOYO ---
 def get_headers(): return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
@@ -82,8 +78,7 @@ def decode_occ_symbol(symbol):
 
 def clean_df_finance(df):
     if df.empty: return pd.Series()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
     col = 'Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else df.columns[0])
     series = df[col]
     series.index = series.index.tz_localize(None)
@@ -104,31 +99,36 @@ def get_beta(ticker, spy_returns):
 
 # --- MOTOR DE ANÁLISIS ---
 def run_master_analysis():
+    # Perfil
     r_p = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
     if r_p.status_code != 200: return None
     prof = r_p.json()['profile']['account']
     acct_id = prof['account_number'] if isinstance(prof, dict) else prof[0]['account_number']
     
+    # Balance
     r_b = requests.get(f"{BASE_URL}/accounts/{acct_id}/balances", headers=get_headers())
     net_liq = float(r_b.json()['balances']['total_equity'])
 
+    # Posiciones
     r_pos = requests.get(f"{BASE_URL}/accounts/{acct_id}/positions", headers=get_headers())
     raw_pos = r_pos.json().get('positions', {}).get('position', [])
     if not raw_pos or raw_pos == 'null': raw_pos = []
     if isinstance(raw_pos, dict): raw_pos = [raw_pos]
 
+    # Ganancias Realizadas (Gain/Loss)
     r_gl = requests.get(f"{BASE_URL}/accounts/{acct_id}/gainloss", headers=get_headers())
     gl_data = r_gl.json().get('gainloss', {}).get('closed_position', [])
     if isinstance(gl_data, dict): gl_data = [gl_data]
 
+    # Quotes
     all_syms = list(set(["SPY"] + [p['symbol'] for p in raw_pos] + [get_underlying_symbol(p['symbol']) for p in raw_pos]))
     r_q = requests.get(f"{BASE_URL}/markets/quotes", params={'symbols': ",".join(all_syms), 'greeks': 'true'}, headers=get_headers())
     m_map = {q['symbol']: q for q in r_q.json().get('quotes', {}).get('quote', [])} if r_q else {}
     spy_p = float(m_map.get('SPY', {}).get('last', 685))
 
+    # Yahoo para Beta
     spy_df_raw = yf.download("SPY", period="1y", progress=False)
     spy_ret = clean_df_finance(spy_df_raw).pct_change().dropna()
-    if spy_ret.empty: return None
 
     total_rd, total_th, total_exp, total_bwd = 0, 0, 0, 0
     t_map = {}
@@ -136,6 +136,7 @@ def run_master_analysis():
 
     for p in raw_pos:
         sym = p['symbol']
+        qty_val = float(p['quantity'])
         u_sym = get_underlying_symbol(sym)
         m_d = m_map.get(sym, {})
         u_p = float(m_map.get(u_sym, {}).get('last', 0))
@@ -146,30 +147,25 @@ def run_master_analysis():
         th = float(m_d.get('greeks', {}).get('theta', 0))
         ex = float(m_d.get('greeks', {}).get('extrinsic', 0))
         
-        # Calcular DTE
-        dte = 0
-        if is_opt and m_d.get('expiration_date'):
-            exp_dt = datetime.strptime(m_d.get('expiration_date'), '%Y-%m-%d')
-            dte = (exp_dt - datetime.now()).days
-
         if u_sym not in t_map:
             t_map[u_sym] = {'d_usd': 0, 'th_usd': 0, 'd_puro': 0, 'beta': get_beta(u_sym, spy_ret), 'price': u_p}
         
-        t_map[u_sym]['d_usd'] += (qty_val := float(p['quantity'])) * d * mult * u_p
+        t_map[u_sym]['d_usd'] += qty_val * d * mult * u_p
         t_map[u_sym]['th_usd'] += (qty_val * th * mult)
         t_map[u_sym]['d_puro'] += (qty_val * d * mult)
         total_rd += (qty_val * d * mult)
         total_th += (qty_val * th * mult)
         
-        market_val = qty_val * float(m_d.get('last', 0)) * mult
-        cost_val = abs(float(p.get('cost_basis', 0)))
+        cost_basis = abs(float(p.get('cost_basis', 0)))
+        last_price = float(m_d.get('last', 0))
+        market_val = qty_val * last_price * mult
 
         detailed_positions.append({
             "Symbol": sym, "Qty": qty_val, "Underlying": u_sym, "Type": "option" if is_opt else "stock",
             "Delta": d, "Theta": th, "Price": u_p, "Extrinsic": ex, "Strike": m_d.get('strike', 0),
-            "Exp": m_d.get('expiration_date', 'N/A'), "Cost": cost_val,
-            "Acquired": p.get('date_acquired', 'N/A')[:10], "Last": float(m_d.get('last', 0)),
-            "Value": market_val, "P_L": market_val - cost_val, "DTE": dte
+            "Exp": m_d.get('expiration_date', 'N/A'), "Cost": cost_basis,
+            "Acquired": p.get('date_acquired', 'N/A')[:10], "Last": last_price,
+            "Value": market_val, "P_L": market_val - cost_basis
         })
 
     for s, data in t_map.items():
@@ -183,14 +179,13 @@ def run_master_analysis():
         "gl": gl_data, "spy_p": spy_p
     }
 
-# --- UI TABS ---
+# --- UI ---
 tab_risk, tab_ceo = st.tabs(["📊 Riesgo & Gráficos", "🏗️ CEO PMCC Accountant"])
 
 if TRADIER_TOKEN:
-    if st.button("🚀 ACTUALIZAR COMMAND CENTER"):
+    if st.button("🚀 ACTUALIZAR TODO EL COMANDO"):
         d = run_master_analysis()
         if d:
-            # Snapshot Historial
             new_h = {"Timestamp": datetime.now().strftime("%H:%M:%S"), "Net_Liq": d['nl'], "Delta_Neto": d['rd'], "BWD_SPY": d['bwd'], "Theta_Diario": d['th'], "Apalancamiento": d['lev']/d['nl']}
             st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([new_h])], ignore_index=True)
 
@@ -205,7 +200,6 @@ if TRADIER_TOKEN:
                 st.divider()
                 h = st.session_state.history_df
                 if len(h) > 1:
-                    st.subheader("📈 Tendencias de la Sesión")
                     g1, g2 = st.columns(2)
                     g1.write("**Capital ($)**"); g1.area_chart(h, x="Timestamp", y="Net_Liq")
                     g2.write("**Riesgo BWD**"); g2.line_chart(h, x="Timestamp", y="BWD_SPY")
@@ -217,38 +211,49 @@ if TRADIER_TOKEN:
                 for und, group in df_det[df_det['Type'] == "option"].groupby('Underlying'):
                     longs = group[(group['Qty'] > 0) & (group['Delta'].abs() > 0.55)]
                     if not longs.empty:
-                        start_date = datetime.strptime(longs['Acquired'].min(), '%Y-%m-%d')
+                        # 1. Fecha inicio campaña para filtro
+                        start_date_str = longs['Acquired'].min()
+                        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+                        
                         realized_income = 0
                         closed_list = []
                         for gl in d['gl']:
                             u_sym, o_type, strike = decode_occ_symbol(gl.get('symbol',''))
                             if u_sym == und and o_type == "CALL":
                                 close_dt = datetime.strptime(gl.get('close_date','2000-01-01')[:10], '%Y-%m-%d')
+                                open_dt = datetime.strptime(gl.get('open_date','2000-01-01')[:10], '%Y-%m-%d')
+                                
                                 if close_dt >= start_date:
                                     is_leap_strike = any(abs(strike - ls) < 0.5 for ls in longs['Strike'])
                                     if not is_leap_strike:
                                         gain = float(gl.get('gain_loss', 0))
                                         realized_income += gain
-                                        closed_list.append({"Fecha": close_dt.strftime('%Y-%m-%d'), "Strike": strike, "P/L": gain})
+                                        # Calcular DIT del trade
+                                        dit_trade = (close_dt - open_dt).days
+                                        closed_list.append({
+                                            "Cerrado": close_dt.strftime('%Y-%m-%d'),
+                                            "Categoría": "INCOME (CC)",
+                                            "Tipo": "CALL",
+                                            "Qty": int(float(gl.get('quantity', 0))),
+                                            "Strike": strike,
+                                            "P/L": gain,
+                                            "DIT": dit_trade
+                                        })
 
                         l_cost = longs['Cost'].sum()
-                        l_val = longs['Value'].sum()
+                        l_val = (longs['Last'] * longs['Qty'] * 100).sum()
                         net_inc = (l_val - l_cost) + realized_income
                         roi = (net_inc / l_cost * 100) if l_cost > 0 else 0
 
                         st.markdown(f'<div class="section-header">SYMBOL: {und} (Spot: ${group["Price"].iloc[0]:.2f})</div>', unsafe_allow_html=True)
-                        
                         cc1, cc2, cc3, cc4, cc5 = st.columns(5)
                         cc1.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">COSTO LEAPS</p><p class="kpi-value">${l_cost:,.2f}</p></div>', unsafe_allow_html=True)
                         cc2.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${l_val:,.2f}</p></div>', unsafe_allow_html=True)
                         cc3.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">CC REALIZADO</p><p class="kpi-value" style="color:#4ade80">${realized_income:,.2f}</p></div>', unsafe_allow_html=True)
                         cc4.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">NET INCOME</p><p class="kpi-value">${net_inc:,.2f}</p></div>', unsafe_allow_html=True)
-                        
-                        roi_col = "#4ade80" if roi >= 0 else "#f87171"
-                        cc5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{roi_col}">{roi:.1f}%</p></div>', unsafe_allow_html=True)
+                        cc5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{"#4ade80" if roi > 0 else "#f87171"}">{roi:.1f}%</p></div>', unsafe_allow_html=True)
                         
                         st.write("### 🏛️ CORE POSITION (LEAPS)")
-                        # Restauración de las 7 columnas: Adquirido, Exp, Strike, Qty, Cost, Value, P/L
                         core_table = longs[['Acquired', 'Exp', 'Strike', 'Qty', 'Cost', 'Value', 'P_L']]
                         core_table.columns = ['Adquirido', 'Exp', 'Strike', 'Qty', 'Cost', 'Value', 'P/L']
                         st.table(core_table.style.format({"Cost": "${:,.2f}", "Value": "${:,.2f}", "P/L": "${:,.2f}"}))
@@ -256,16 +261,25 @@ if TRADIER_TOKEN:
                         shorts = group[(group['Qty'] < 0) & (group['Delta'].abs() < 0.50)]
                         if not shorts.empty:
                             sc = shorts.iloc[0]
-                            # Restauración de DTE y Extrínseco ($)
-                            st.write(f"### 🥤 MONITOR DE JUGO: Strike {sc['Strike']} | DTE: {sc['DTE']} | **Extrínseco: ${sc['Extrinsic']:.2f}**")
-                            if sc['Extrinsic'] < 0.20: st.error("🚨 TIEMPO DE ROLEAR")
+                            # Cálculo manual de extrínseco para mayor precisión
+                            u_spot = group["Price"].iloc[0]
+                            sc_strike = sc['Strike']
+                            sc_last = sc['Last']
+                            # Extrínseco = Last - Max(0, Spot - Strike)
+                            juice_val = sc_last - max(0, u_spot - sc_strike)
+                            
+                            st.write(f"### 🥤 MONITOR DE JUGO: Strike {sc_strike} | DTE: {sc['DTE']} | **Extrínseco: ${juice_val:.2f}**")
+                            if juice_val < 0.15: st.error("🚨 TIEMPO DE ROLEAR")
                         
                         if closed_list:
-                            with st.expander("Ver Historial Cerrado"): st.table(pd.DataFrame(closed_list))
+                            with st.expander("📔 Ver Historial Filtrado de la Campaña"):
+                                df_cl = pd.DataFrame(closed_list).sort_values("Cerrado", ascending=False)
+                                st.dataframe(df_cl.style.format({"P/L": "${:,.2f}", "Strike": "{:.2f}"}), use_container_width=True)
                         st.divider()
 
             with st.expander("Ver Detalle Crudo"): st.dataframe(df_det)
 else:
     st.info("👈 Ingresa tu Token de Tradier.")
+
 
 
