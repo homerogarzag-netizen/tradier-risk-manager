@@ -19,6 +19,7 @@ st.markdown("""
         background-color: #1f2937; 
         padding: 20px; border-radius: 12px; 
         border: 1px solid #374151; text-align: center; height: 140px;
+        box-shadow: 2px 2px 10px rgba(0,0,0,0.3);
     }
     .metric-label {color: #9ca3af; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; margin-bottom: 8px;}
     .metric-value {font-size: 1.5rem; font-weight: bold; margin: 0;}
@@ -48,7 +49,7 @@ with st.sidebar:
     env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
     st.divider()
-    st.caption("v17.3.0 | Full History & Juice Fix")
+    st.caption("v17.4.0 | DTE & Column Fix")
 
 # --- FUNCIONES DE APOYO ---
 def get_headers(): return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
@@ -78,7 +79,8 @@ def decode_occ_symbol(symbol):
 
 def clean_df_finance(df):
     if df.empty: return pd.Series()
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     col = 'Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else df.columns[0])
     series = df[col]
     series.index = series.index.tz_localize(None)
@@ -147,6 +149,14 @@ def run_master_analysis():
         th = float(m_d.get('greeks', {}).get('theta', 0))
         ex = float(m_d.get('greeks', {}).get('extrinsic', 0))
         
+        # Cálculo Robusto de DTE
+        dte_val = 0
+        if is_opt and m_d.get('expiration_date'):
+            try:
+                exp_dt = datetime.strptime(m_d.get('expiration_date'), '%Y-%m-%d')
+                dte_val = (exp_dt - datetime.now()).days
+            except: dte_val = 0
+
         if u_sym not in t_map:
             t_map[u_sym] = {'d_usd': 0, 'th_usd': 0, 'd_puro': 0, 'beta': get_beta(u_sym, spy_ret), 'price': u_p}
         
@@ -165,7 +175,7 @@ def run_master_analysis():
             "Delta": d, "Theta": th, "Price": u_p, "Extrinsic": ex, "Strike": m_d.get('strike', 0),
             "Exp": m_d.get('expiration_date', 'N/A'), "Cost": cost_basis,
             "Acquired": p.get('date_acquired', 'N/A')[:10], "Last": last_price,
-            "Value": market_val, "P_L": market_val - cost_basis
+            "Value": market_val, "P_L": market_val - cost_basis, "DTE": dte_val
         })
 
     for s, data in t_map.items():
@@ -179,11 +189,11 @@ def run_master_analysis():
         "gl": gl_data, "spy_p": spy_p
     }
 
-# --- UI ---
+# --- UI TABS ---
 tab_risk, tab_ceo = st.tabs(["📊 Riesgo & Gráficos", "🏗️ CEO PMCC Accountant"])
 
 if TRADIER_TOKEN:
-    if st.button("🚀 ACTUALIZAR TODO EL COMANDO"):
+    if st.button("🚀 ACTUALIZAR COMMAND CENTER"):
         d = run_master_analysis()
         if d:
             new_h = {"Timestamp": datetime.now().strftime("%H:%M:%S"), "Net_Liq": d['nl'], "Delta_Neto": d['rd'], "BWD_SPY": d['bwd'], "Theta_Diario": d['th'], "Apalancamiento": d['lev']/d['nl']}
@@ -200,18 +210,23 @@ if TRADIER_TOKEN:
                 st.divider()
                 h = st.session_state.history_df
                 if len(h) > 1:
+                    st.subheader("📈 Tendencias de la Sesión")
                     g1, g2 = st.columns(2)
                     g1.write("**Capital ($)**"); g1.area_chart(h, x="Timestamp", y="Net_Liq")
                     g2.write("**Riesgo BWD**"); g2.line_chart(h, x="Timestamp", y="BWD_SPY")
+
+                st.subheader("📊 Riesgo por Activo")
+                r_rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['d_puro'], "Net Delta $": v['d_usd'], "BWD": (v['d_usd']*v['beta'])/d['spy_p']} for k,v in d['risk'].items()]
+                st.dataframe(pd.DataFrame(r_rows).sort_values(by='BWD', ascending=False), use_container_width=True)
 
             with tab_ceo:
                 st.subheader("📋 Contabilidad Forense de Campañas PMCC")
                 df_det = pd.DataFrame(d['detailed'])
                 
                 for und, group in df_det[df_det['Type'] == "option"].groupby('Underlying'):
+                    # Identificar LEAPS (Core)
                     longs = group[(group['Qty'] > 0) & (group['Delta'].abs() > 0.55)]
                     if not longs.empty:
-                        # 1. Fecha inicio campaña para filtro
                         start_date_str = longs['Acquired'].min()
                         start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
                         
@@ -222,30 +237,21 @@ if TRADIER_TOKEN:
                             if u_sym == und and o_type == "CALL":
                                 close_dt = datetime.strptime(gl.get('close_date','2000-01-01')[:10], '%Y-%m-%d')
                                 open_dt = datetime.strptime(gl.get('open_date','2000-01-01')[:10], '%Y-%m-%d')
-                                
                                 if close_dt >= start_date:
                                     is_leap_strike = any(abs(strike - ls) < 0.5 for ls in longs['Strike'])
                                     if not is_leap_strike:
                                         gain = float(gl.get('gain_loss', 0))
                                         realized_income += gain
-                                        # Calcular DIT del trade
-                                        dit_trade = (close_dt - open_dt).days
-                                        closed_list.append({
-                                            "Cerrado": close_dt.strftime('%Y-%m-%d'),
-                                            "Categoría": "INCOME (CC)",
-                                            "Tipo": "CALL",
-                                            "Qty": int(float(gl.get('quantity', 0))),
-                                            "Strike": strike,
-                                            "P/L": gain,
-                                            "DIT": dit_trade
-                                        })
+                                        closed_list.append({"Cerrado": close_dt.strftime('%Y-%m-%d'), "Strike": strike, "P/L": gain, "DIT": (close_dt-open_dt).days})
 
                         l_cost = longs['Cost'].sum()
-                        l_val = (longs['Last'] * longs['Qty'] * 100).sum()
+                        l_val = longs['Value'].sum()
                         net_inc = (l_val - l_cost) + realized_income
                         roi = (net_inc / l_cost * 100) if l_cost > 0 else 0
 
                         st.markdown(f'<div class="section-header">SYMBOL: {und} (Spot: ${group["Price"].iloc[0]:.2f})</div>', unsafe_allow_html=True)
+                        
+                        # --- LAS 5 TARJETAS ---
                         cc1, cc2, cc3, cc4, cc5 = st.columns(5)
                         cc1.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">COSTO LEAPS</p><p class="kpi-value">${l_cost:,.2f}</p></div>', unsafe_allow_html=True)
                         cc2.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${l_val:,.2f}</p></div>', unsafe_allow_html=True)
@@ -254,32 +260,31 @@ if TRADIER_TOKEN:
                         cc5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{"#4ade80" if roi > 0 else "#f87171"}">{roi:.1f}%</p></div>', unsafe_allow_html=True)
                         
                         st.write("### 🏛️ CORE POSITION (LEAPS)")
+                        # Restauración de las 7 columnas exactas
                         core_table = longs[['Acquired', 'Exp', 'Strike', 'Qty', 'Cost', 'Value', 'P_L']]
                         core_table.columns = ['Adquirido', 'Exp', 'Strike', 'Qty', 'Cost', 'Value', 'P/L']
                         st.table(core_table.style.format({"Cost": "${:,.2f}", "Value": "${:,.2f}", "P/L": "${:,.2f}"}))
                         
+                        # Identificar Short Activo para Monitor de Jugo
                         shorts = group[(group['Qty'] < 0) & (group['Delta'].abs() < 0.50)]
                         if not shorts.empty:
                             sc = shorts.iloc[0]
-                            # Cálculo manual de extrínseco para mayor precisión
                             u_spot = group["Price"].iloc[0]
-                            sc_strike = sc['Strike']
-                            sc_last = sc['Last']
-                            # Extrínseco = Last - Max(0, Spot - Strike)
-                            juice_val = sc_last - max(0, u_spot - sc_strike)
+                            # Cálculo manual ultra-seguro de extrínseco para evitar el error 'DTE'
+                            juice_val = sc['Last'] - max(0, u_spot - sc['Strike'])
                             
-                            st.write(f"### 🥤 MONITOR DE JUGO: Strike {sc_strike} | DTE: {sc['DTE']} | **Extrínseco: ${juice_val:.2f}**")
+                            st.write(f"### 🥤 MONITOR DE JUGO: Strike {sc['Strike']} | DTE: {sc['DTE']} | **Extrínseco: ${juice_val:.2f}**")
                             if juice_val < 0.15: st.error("🚨 TIEMPO DE ROLEAR")
                         
                         if closed_list:
-                            with st.expander("📔 Ver Historial Filtrado de la Campaña"):
-                                df_cl = pd.DataFrame(closed_list).sort_values("Cerrado", ascending=False)
-                                st.dataframe(df_cl.style.format({"P/L": "${:,.2f}", "Strike": "{:.2f}"}), use_container_width=True)
+                            with st.expander("Ver Historial Cerrado"): 
+                                st.table(pd.DataFrame(closed_list).sort_values("Cerrado", ascending=False))
                         st.divider()
 
             with st.expander("Ver Detalle Crudo"): st.dataframe(df_det)
 else:
     st.info("👈 Ingresa tu Token de Tradier.")
+
 
 
 
