@@ -33,7 +33,7 @@ st.markdown("""
     }
     .summary-card-pmcc {
         background-color: #161b22; border: 1px solid #30363d;
-        padding: 15px; border-radius: 8px; text-align: center; height: 110px;
+        padding: 15px; border-radius: 8px; text-align: center; height: 120px;
     }
     .roi-val {font-size: 1.6rem; font-weight: bold;}
     </style>
@@ -52,7 +52,7 @@ with st.sidebar:
     env_mode = st.radio("Entorno", ["Producción (Real)", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción (Real)" else "https://sandbox.tradier.com/v1"
     st.divider()
-    st.caption("v17.0.0 | CEO UI Restore")
+    st.caption("v17.1.0 | CEO UI Final Fix")
 
 # --- FUNCIONES DE APOYO ---
 def get_headers(): return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
@@ -82,7 +82,8 @@ def decode_occ_symbol(symbol):
 
 def clean_df_finance(df):
     if df.empty: return pd.Series()
-    if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     col = 'Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else df.columns[0])
     series = df[col]
     series.index = series.index.tz_localize(None)
@@ -163,7 +164,8 @@ def run_master_analysis():
         })
 
     for s, data in t_map.items():
-        total_bwd += (data['d_usd'] * data['beta']) / spy_p if spy_price := spy_p > 0 else 0
+        if spy_p > 0:
+            total_bwd += (data['d_usd'] * data['beta']) / spy_p
         total_exp += abs(data['d_usd'])
 
     return {
@@ -172,36 +174,38 @@ def run_master_analysis():
         "gl": gl_data, "spy_p": spy_p
     }
 
-# --- UI TABS ---
+# --- UI ---
 tab_risk, tab_ceo = st.tabs(["📊 Riesgo & Gráficos", "🏗️ CEO PMCC Accountant"])
 
 if TRADIER_TOKEN:
     if st.button("🚀 ACTUALIZAR COMMAND CENTER"):
         d = run_master_analysis()
         if d:
-            # Snapshot Historial
             new_h = {"Timestamp": datetime.now().strftime("%H:%M:%S"), "Net_Liq": d['nl'], "Delta_Neto": d['rd'], "BWD_SPY": d['bwd'], "Theta_Diario": d['th'], "Apalancamiento": d['lev']/d['nl']}
             st.session_state.history_df = pd.concat([st.session_state.history_df, pd.DataFrame([new_h])], ignore_index=True)
 
             with tab_risk:
                 st.markdown(f"### 🏦 Balance Neto: ${d['nl']:,.2f}")
                 k1, k2, k3, k4 = st.columns(4)
-                k1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value">{d["rd"]:.1f}</div><div class="metric-sub">Deltas Puros</div></div>', unsafe_allow_html=True)
-                k2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value">{d["bwd"]:.1f}</div><div class="metric-sub">Riesgo Beta-Ajustado</div></div>', unsafe_allow_html=True)
-                k3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:#4ade80">${d["th"]:.2f}</div><div class="metric-sub">Income Diario</div></div>', unsafe_allow_html=True)
-                k4.markdown(f'<div class="card"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value">{d["lev"]/d["nl"]:.2f}x</div><div class="metric-sub">Nocional / Cash</div></div>', unsafe_allow_html=True)
+                k1.markdown(f'<div class="card"><div class="metric-label">DELTA NETO</div><div class="metric-value">{d["rd"]:.1f}</div></div>', unsafe_allow_html=True)
+                k2.markdown(f'<div class="card"><div class="metric-label">BWD (SPY)</div><div class="metric-value">{d["bwd"]:.1f}</div></div>', unsafe_allow_html=True)
+                k3.markdown(f'<div class="card"><div class="metric-label">THETA DIARIO</div><div class="metric-value" style="color:#4ade80">${d["th"]:.2f}</div></div>', unsafe_allow_html=True)
+                k4.markdown(f'<div class="card" style="border-bottom: 5px solid #00d4ff"><div class="metric-label">APALANCAMIENTO</div><div class="metric-value">{d["lev"]/d["nl"]:.2f}x</div></div>', unsafe_allow_html=True)
 
                 st.divider()
                 h = st.session_state.history_df
                 if len(h) > 1:
                     g1, g2 = st.columns(2)
-                    with g1: st.write("**Capital ($)**"); st.area_chart(h, x="Timestamp", y="Net_Liq")
-                    with g2: st.write("**Riesgo BWD**"); st.line_chart(h, x="Timestamp", y="BWD_SPY")
+                    g1.write("**Capital ($)**"); g1.area_chart(h, x="Timestamp", y="Net_Liq")
+                    g2.write("**Riesgo BWD**"); g2.line_chart(h, x="Timestamp", y="BWD_SPY")
+
+                st.subheader("📊 Riesgo por Activo")
+                r_rows = [{"Activo": k, "Beta": v['beta'], "Delta Puro": v['d_puro'], "Net Delta $": v['d_usd'], "BWD": (v['d_usd']*v['beta'])/d['spy_p']} for k,v in d['risk'].items()]
+                st.dataframe(pd.DataFrame(r_rows).sort_values(by='BWD', ascending=False), use_container_width=True)
 
             with tab_ceo:
                 st.subheader("📋 Contabilidad Forense de Campañas PMCC")
                 df_det = pd.DataFrame(d['detailed'])
-                
                 for und, group in df_det[df_det['Type'] == "option"].groupby('Underlying'):
                     longs = group[(group['Qty'] > 0) & (group['Delta'].abs() > 0.55)]
                     if not longs.empty:
@@ -225,16 +229,12 @@ if TRADIER_TOKEN:
                         roi = (net_inc / l_cost * 100) if l_cost > 0 else 0
 
                         st.markdown(f'<div class="section-header">SYMBOL: {und} (Spot: ${group["Price"].iloc[0]:.2f})</div>', unsafe_allow_html=True)
-                        
-                        # --- LAS 5 TARJETAS RECUPERADAS ---
                         cc1, cc2, cc3, cc4, cc5 = st.columns(5)
                         cc1.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">COSTO LEAPS</p><p class="kpi-value">${l_cost:,.2f}</p></div>', unsafe_allow_html=True)
                         cc2.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${l_val:,.2f}</p></div>', unsafe_allow_html=True)
                         cc3.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">CC REALIZADO</p><p class="kpi-value" style="color:#4ade80">${realized_income:,.2f}</p></div>', unsafe_allow_html=True)
                         cc4.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">NET INCOME</p><p class="kpi-value">${net_inc:,.2f}</p></div>', unsafe_allow_html=True)
-                        
-                        roi_col = "#4ade80" if roi >= 0 else "#f87171"
-                        cc5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{roi_col}">{roi:.1f}%</p></div>', unsafe_allow_html=True)
+                        cc5.markdown(f'<div class="summary-card-pmcc"><p class="kpi-label">ROI TOTAL</p><p class="roi-val" style="color:{"#4ade80" if roi > 0 else "#f87171"}">{roi:.1f}%</p></div>', unsafe_allow_html=True)
                         
                         st.write("### 🏛️ CORE POSITION (LEAPS)")
                         st.table(longs[['Exp', 'Strike', 'Qty', 'Delta']])
@@ -243,14 +243,11 @@ if TRADIER_TOKEN:
                         if not shorts.empty:
                             sc = shorts.iloc[0]
                             j = sc['Extrinsic'] * 100 * abs(sc['Qty'])
-                            st.write(f"🥤 **Active Short:** K {sc['Strike']} | Exp: {sc['Exp']} | **Jugo: ${j:.2f}**")
-                            if j < 15: st.error("🚨 TIEMPO DE ROLEAR")
-                        
+                            st.write(f"### 🥤 Active Short: Strike {sc['Strike']} | **Jugo: ${j:.2f}**")
                         if closed_list:
-                            with st.expander("📔 Ver Historial Filtrado"): st.table(pd.DataFrame(closed_list))
+                            with st.expander("Ver Historial"): st.table(pd.DataFrame(closed_list))
                         st.divider()
-
-            with st.expander("Ver Detalle Crudo"): st.dataframe(df_det)
 else:
     st.info("👈 Ingresa tu Token de Tradier.")
+
 
