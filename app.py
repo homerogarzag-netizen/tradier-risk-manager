@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(layout="wide", page_title="PMCC Master V15.4", page_icon="📈")
+st.set_page_config(layout="wide", page_title="PMCC Master V15.5", page_icon="📈")
 
 # Estilo visual Tom King
 st.markdown("""
@@ -26,7 +26,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🏗️ PMCC Master Accountant (V15.4 - Campaign Filter)")
+st.title("🏗️ PMCC Master Accountant (V15.5 - Call Only Filter)")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -35,7 +35,7 @@ with st.sidebar:
     env_mode = st.radio("Entorno", ["Producción", "Sandbox"])
     BASE_URL = "https://api.tradier.com/v1" if env_mode == "Producción" else "https://sandbox.tradier.com/v1"
     st.divider()
-    st.info("Filtro de campaña activo: Solo se muestran trades posteriores a la compra del LEAPS.")
+    st.info("Filtro Estricto: Solo se contabilizan CALLS cerradas posteriores a la compra del LEAPS.")
 
 # --- FUNCIONES DE APOYO ---
 
@@ -59,7 +59,7 @@ def get_underlying(symbol):
 
 # --- MOTOR DE DATOS ---
 
-def run_v15_4_analysis():
+def run_v15_5_analysis():
     # 1. Identificar Cuenta
     r_profile = requests.get(f"{BASE_URL}/user/profile", headers=get_headers())
     if r_profile.status_code != 200: return None
@@ -84,7 +84,7 @@ def run_v15_4_analysis():
 
     report = {}
 
-    # A. Identificar Leaps (CORE) y establecer fecha de inicio de campaña
+    # A. Identificar Leaps (CORE) y Fecha de Inicio
     for p in positions:
         sym = p['symbol']
         u_sym = get_underlying(sym)
@@ -93,7 +93,6 @@ def run_v15_4_analysis():
         
         if float(p['quantity']) > 0 and delta and abs(delta) > 0.50:
             if u_sym not in report:
-                # Inicializar reporte del activo
                 report[u_sym] = {
                     "leaps": [], 
                     "leaps_strikes": [],
@@ -108,7 +107,6 @@ def run_v15_4_analysis():
             v = float(p['quantity']) * q_data.get('last', 0) * 100
             s_val = q_data.get('strike', 0)
             
-            # Registrar fecha de adquisición para filtrar el historial
             acq_date = datetime.strptime(p['date_acquired'][:10], '%Y-%m-%d')
             if report[u_sym]["start_date"] is None or acq_date < report[u_sym]["start_date"]:
                 report[u_sym]["start_date"] = acq_date
@@ -118,40 +116,37 @@ def run_v15_4_analysis():
                 "Adquirido": p.get('date_acquired', 'N/A')[:10],
                 "Exp": q_data.get('expiration_date'),
                 "Strike": s_val,
-                "Qty": p['quantity'],
+                "Qty": int(float(p['quantity'])),
                 "Cost": c, "Value": v, "P/L": v - c
             })
 
-    # B. Auditoría Filtrada (Solo trades posteriores al LEAPS)
+    # B. Auditoría Filtrada (Solo CALLS de Campaña)
     for gl in gl_data:
         sym = gl.get('symbol', '')
         u_sym, opt_type, strike = decode_occ_symbol(sym)
         
-        if u_sym in report and opt_type != "STOCK":
-            # FILTRO DE CAMPAÑA: Solo trades cerrados después de comprar el LEAPS
+        # FILTRO 1: Solo si es CALL (ignorar Puts o Acciones)
+        if u_sym in report and opt_type == "CALL":
+            # FILTRO 2: Solo trades cerrados después de comprar el LEAPS
             close_date = datetime.strptime(gl.get('close_date', '2000-01-01')[:10], '%Y-%m-%d')
             
             if close_date >= report[u_sym]["start_date"]:
                 gain = float(gl.get('gain_loss', 0))
-                qty = float(gl.get('quantity', 0))
+                qty = abs(int(float(gl.get('quantity', 0))))
                 
+                # Identificar si es cierre de un LEAPS o venta de renta
                 is_core = any(abs(strike - ls) < 0.5 for ls in report[u_sym]['leaps_strikes'])
-                
-                category = "CORE (Leaps)" if is_core else "INCOME (CC)"
-                action = "BTO → STC" if is_core else "STO → BTC"
                 
                 if not is_core:
                     report[u_sym]['realized_cc'] += gain
-                
-                report[u_sym]['closed_list'].append({
-                    "Cerrado": gl.get('close_date', 'N/A')[:10],
-                    "Categoría": category,
-                    "Tipo": opt_type,
-                    "Qty": qty,
-                    "Strike": strike,
-                    "P/L": gain,
-                    "DIT": gl.get('term', '-')
-                })
+                    report[u_sym]['closed_list'].append({
+                        "Cerrado": gl.get('close_date', 'N/A')[:10],
+                        "Tipo": opt_type,
+                        "Qty": qty,
+                        "Strike": strike,
+                        "P/L": gain,
+                        "DIT": gl.get('term', '-')
+                    })
 
     # C. Corto Activo
     for p in positions:
@@ -161,8 +156,9 @@ def run_v15_4_analysis():
             u_p = report[u_sym]['spot']
             strike = q.get('strike', 0)
             opt_p = q.get('last', 0)
+            juice = opt_p - max(0, u_p - strike)
             report[u_sym]['active_short'] = {
-                "Strike": strike, "Price": opt_p, "Ext": opt_p - max(0, u_p - strike),
+                "Strike": strike, "Price": opt_p, "Ext": juice,
                 "DTE": (datetime.strptime(q['expiration_date'], '%Y-%m-%d') - datetime.now()).days
             }
 
@@ -172,12 +168,11 @@ def run_v15_4_analysis():
 
 if TOKEN:
     if st.button("🚀 ACTUALIZAR REPORTE DE CAMPAÑA"):
-        data = run_v15_4_analysis()
+        data = run_v15_5_analysis()
         if data:
             for ticker, d in data.items():
                 st.markdown(f'<div class="section-header">SYMBOL: {ticker} (Spot: ${d["spot"]:.2f})</div>', unsafe_allow_html=True)
                 
-                # KPIs
                 tc = sum([l['Cost'] for l in d['leaps']])
                 tv = sum([l['Value'] for l in d['leaps']])
                 re = d['realized_cc']
@@ -187,29 +182,32 @@ if TOKEN:
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.markdown(f'<div class="summary-card"><p class="kpi-label">COSTO LEAPS</p><p class="kpi-value">${tc:,.2f}</p></div>', unsafe_allow_html=True)
                 c2.markdown(f'<div class="summary-card"><p class="kpi-label">VALOR ACTUAL</p><p class="kpi-value">${tv:,.2f}</p></div>', unsafe_allow_html=True)
-                c3.markdown(f'<div class="summary-card"><p class="kpi-label">CC REALIZADO (CAMPAÑA)</p><p class="kpi-value" style="color:#4ade80">${re:,.2f}</p></div>', unsafe_allow_html=True)
+                c3.markdown(f'<div class="summary-card"><p class="kpi-label">CC REALIZADO (INCOME)</p><p class="kpi-value" style="color:#4ade80">${re:,.2f}</p></div>', unsafe_allow_html=True)
                 c4.markdown(f'<div class="summary-card"><p class="kpi-label">NET INCOME</p><p class="kpi-value">${ni:,.2f}</p></div>', unsafe_allow_html=True)
                 
                 r_c = "#4ade80" if ro > 0 else "#f87171"
                 c5.markdown(f'<div class="summary-card"><p class="kpi-label">ROI TOTAL</p><p class="kpi-value" style="color:{r_c}">{ro:.1f}%</p></div>', unsafe_allow_html=True)
 
                 st.write("### 🏛️ CORE POSITION (LEAPS)")
-                st.table(pd.DataFrame(d['leaps']).style.format({"Cost": "${:,.2f}", "Value": "${:,.2f}", "P/L": "${:,.2f}"}))
+                st.table(pd.DataFrame(d['leaps']))
 
                 if d['active_short']:
                     ash = d['active_short']
                     st.write(f"### 🥤 MONITOR DE JUGO: Strike {ash['Strike']} | DTE: {ash['DTE']} | **Extrínseco: ${ash['Ext']:.2f}**")
 
                 if d['closed_list']:
-                    with st.expander(f"📔 Ver Historial Filtrado de la Campaña ({ticker})"):
+                    with st.expander(f"📔 Ver Historial de Ventas Cerradas (Solo Calls)"):
                         df_cl = pd.DataFrame(d['closed_list']).sort_values("Cerrado", ascending=False)
-                        st.dataframe(df_cl.style.format({"P/L": "${:,.2f}", "Strike": "{:.2f}", "Qty": "{:.0f}"}), use_container_width=True)
+                        st.dataframe(df_cl.style.format({"P/L": "${:,.2f}", "Strike": "{:.2f}"}), use_container_width=True)
+                else:
+                    st.info("No hay ventas de Calls cerradas para esta campaña todavía.")
                 
                 st.divider()
         else:
-            st.error("Error al obtener datos o no hay campañas PMCC activas.")
+            st.error("No se detectaron campañas activas.")
 else:
     st.info("👈 Introduce tu Token.")
+
 
 
 
